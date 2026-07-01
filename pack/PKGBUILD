@@ -35,7 +35,7 @@ build() {
 package() {
   cd "$srcdir/$_pkgbase-$pkgver"
   install -Dm 755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
-  install -Dm 600 "config/config.json" "$pkgdir/etc/corplink/config.json"
+  install -Dm 600 "config.template.json" "$pkgdir/etc/corplink/config.json"
   install -Dm 644 "systemd/$pkgname.service" "$pkgdir/usr/lib/systemd/system/$pkgname.service"
   install -Dm 644 "systemd/$pkgname@.service" "$pkgdir/usr/lib/systemd/system/$pkgname@.service"
 }

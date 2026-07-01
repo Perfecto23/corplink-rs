@@ -52,7 +52,7 @@ jobs:
       - name: create tarball
         run: |
           cp pack/pkg/corplink-rs/usr/bin/corplink-rs .
-          cp config/config.json .
+          cp config.template.json config.json
           tar -czf corplink-rs-${{ github.ref_name }}-linux-$(uname -m).tar.gz corplink-rs config.json
       - name: upload tarball to artifact
         uses: actions/upload-artifact@v6
@@ -88,7 +88,7 @@ jobs:
         run: |
           cd target
           cp release/corplink-rs .
-          cp ../config/config.json .
+          cp ../config.template.json config.json
           tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
       - name: upload package to artifact
         uses: actions/upload-artifact@v6
@@ -127,7 +127,7 @@ jobs:
       - name: build check result
         run: |
           Move-Item -Path "target/release/corplink-rs.exe" -Destination "."
-          Move-Item -Path "config/config.json" -Destination "."
+          Copy-Item -Path "config.template.json" -Destination "config.json"
           Copy-Item -Path "scripts/setup.ps1" -Destination "."
           Compress-Archive -Path corplink-rs.exe,config.json,setup.ps1 -Destination corplink-rs-${{ github.ref_name }}-windows.zip
       - name: upload package to artifact

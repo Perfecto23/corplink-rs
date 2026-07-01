@@ -1,0 +1,30 @@
+{
+  "company_name": "company code name",
+  "username": "your_name",
+  "password": "your_real_password",
+  "platform": "feilian",
+  "interface_name": "utun12345",
+  "use_vpn_dns": false,
+  "auto_setup_routes": true,
+  "route_mode": "split",
+  "vpn_select_strategy": "latency",
+  "managed_routes": {
+    "enabled": true,
+    "stale_ttl_secs": 86400,
+    "include_ipv6": false,
+    "cache_file": ".run/managed-routes-cache.json",
+    "sources": [
+      {
+        "name": "github",
+        "type": "github_meta",
+        "keys": ["web", "api", "git"]
+      },
+      {
+        "name": "redshift-prod",
+        "type": "dns_hosts",
+        "hosts": ["your-cluster.region.redshift.amazonaws.com"],
+        "port": 5439
+      }
+    ]
+  }
+}

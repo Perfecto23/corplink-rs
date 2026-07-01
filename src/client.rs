@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path;
 use std::str::FromStr;
@@ -313,7 +313,9 @@ impl Client {
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
         match TerminalQrCode::from_bytes(url.as_bytes()) {
             Ok(qr) => qr.print(),
-            Err(e) => {log::warn!("failed to generate qr code: {e}");}
+            Err(e) => {
+                log::warn!("failed to generate qr code: {e}");
+            }
         }
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
@@ -790,11 +792,7 @@ impl Client {
                 let offset = self.date_offset_sec / TIME_STEP as i32;
                 let raw_otp = totp_offset(code.as_slice(), offset);
                 otp = format!("{:06}", raw_otp.code);
-                log::info!(
-                    "2fa code generated: {}, {} seconds left",
-                    &otp,
-                    raw_otp.secs_left
-                );
+                log::info!("2fa code generated, {} seconds left", raw_otp.secs_left);
             }
         }
         if otp.is_empty() {
@@ -951,6 +949,9 @@ impl Client {
                 [v4, v6].concat()
             }
         };
+        append_extra_allowed_ips(&mut allowed_ips, self.conf.extra_allowed_ips.as_ref())?;
+        let managed_allowed_ips = crate::managed_routes::resolve_managed_routes(&self.conf).await?;
+        append_routes(&mut allowed_ips, "managed_routes", &managed_allowed_ips)?;
 
         // Carve user-specified CIDRs out of allowed_ips. This removes any IPs in
         // vpn_disallowed_routes from the VPN's AllowedIPs (and the system routes
@@ -1015,6 +1016,7 @@ impl Client {
                 );
             }
         }
+        dedupe_allowed_ips(&mut allowed_ips);
         log::info!(
             "final allowed_ips ({} entries): {:?}",
             allowed_ips.len(),
@@ -1154,5 +1156,94 @@ impl Client {
         let resp = req.send().await.context("logout request failed")?;
         log::info!("logout (current terminal) status: {}", resp.status());
         Ok(())
+    }
+}
+
+fn append_extra_allowed_ips(
+    allowed_ips: &mut Vec<String>,
+    extra_allowed_ips: Option<&Vec<String>>,
+) -> Result<()> {
+    let Some(extra_allowed_ips) = extra_allowed_ips else {
+        return Ok(());
+    };
+    if extra_allowed_ips.is_empty() {
+        return Ok(());
+    }
+
+    append_routes(allowed_ips, "extra_allowed_ips", extra_allowed_ips)
+}
+
+fn append_routes(allowed_ips: &mut Vec<String>, label: &str, routes: &[String]) -> Result<()> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    let before = allowed_ips.len();
+    let mut seen: HashSet<String> = allowed_ips.iter().cloned().collect();
+    for route in routes {
+        let normalized = crate::utils::normalize_route(route)
+            .with_context(|| format!("invalid {label} entry {route:?}"))?;
+        if seen.insert(normalized.clone()) {
+            allowed_ips.push(normalized);
+        }
+    }
+    log::info!(
+        "{} applied: {} -> {} entries (configured: {})",
+        label,
+        before,
+        allowed_ips.len(),
+        routes.len()
+    );
+    Ok(())
+}
+
+fn dedupe_allowed_ips(allowed_ips: &mut Vec<String>) {
+    let before = allowed_ips.len();
+    let mut seen = HashSet::with_capacity(allowed_ips.len());
+    allowed_ips.retain(|route| seen.insert(route.clone()));
+    if allowed_ips.len() != before {
+        log::info!(
+            "deduped allowed_ips: {} -> {} entries",
+            before,
+            allowed_ips.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_extra_allowed_ips_normalizes_bare_ips_and_dedupes() {
+        let mut allowed_ips = vec!["10.0.0.0/8".to_string(), "140.82.112.0/20".to_string()];
+        let extra_allowed_ips = vec![
+            "140.82.112.0/20".to_string(),
+            "20.205.243.166".to_string(),
+            "2001:db8::1".to_string(),
+        ];
+
+        append_extra_allowed_ips(&mut allowed_ips, Some(&extra_allowed_ips)).unwrap();
+
+        assert_eq!(
+            allowed_ips,
+            vec![
+                "10.0.0.0/8",
+                "140.82.112.0/20",
+                "20.205.243.166/32",
+                "2001:db8::1/128"
+            ]
+        );
+    }
+
+    #[test]
+    fn append_extra_allowed_ips_rejects_invalid_routes() {
+        let mut allowed_ips = Vec::new();
+        let extra_allowed_ips = vec!["20.205.243.166/129".to_string()];
+
+        let err = append_extra_allowed_ips(&mut allowed_ips, Some(&extra_allowed_ips))
+            .expect_err("invalid prefix should fail");
+
+        assert!(err.to_string().contains("invalid extra_allowed_ips entry"));
     }
 }

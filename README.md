@@ -24,12 +24,13 @@ cd corplink-rs
 # build libwg
 cd libwg
 ./build.sh
-# if you are using Windows, you can clone and build libwg maunally
+cd ..
+# if you are using Windows, you can clone and build libwg manually
 # ref: wireguard-go/Makefile:libwg
 
 cargo build --release
 # install corplink-rs to your PATH
-mv target/release/corplink-rs /usr/bin/
+sudo install -Dm 755 target/release/corplink-rs /usr/bin/corplink-rs
 ```
 
 ### windows
@@ -72,6 +73,152 @@ systemctl enable corplink-rs.service
 # NOTE: cookies.json is reserved by cookie storage
 systemctl start corplink-rs@test.service
 ```
+
+## 白名单流量接管
+
+如果要让 GitHub、Redshift 等有 IP 白名单限制的公网服务走公司 VPN，推荐使用 `managed_routes`。它会在启动前把目标服务解析成 IP/CIDR，合入 WireGuard `AllowedIPs` 和系统路由；不会改写包含密码、cookie、TOTP、WireGuard key 的主配置。
+
+### 脚本关系与推荐入口
+
+```bash
+scripts/corplink-traffic.sh start
+```
+
+日常只需要维护 `config.local.json`，把 GitHub 和 Redshift endpoint 都写进 `managed_routes.sources`，然后直接运行 `scripts/corplink-traffic.sh start`。脚本会自己解析目标、安装路由并选择一个检查目标等待就绪。
+
+`scripts/corplink-traffic.sh` 是主入口，负责启动进程、解析 managed routes、检查系统路由、测试 GitHub/Redshift 这类白名单目标。
+
+`scripts/corplink-github.sh` 是 GitHub 场景的兼容 wrapper，只做一件事：把检查目标固定为 `github.com`，然后原样转发到 `scripts/corplink-traffic.sh`。新用法优先直接使用 `corplink-traffic.sh`。
+
+```bash
+scripts/corplink-github.sh status
+```
+
+`scripts/update-managed-routes.py` 是解析工具，通常由 `corplink-traffic.sh preflight/start/status` 间接调用。只有在你想单独检查 managed routes 解析结果时才需要直接运行它。
+
+`scripts/corplink-traffic.sh start` 会做三件事：
+
+- 读取 `config.local.json`（也可以用 `CORPLINK_CONFIG=/path/to/config.json` 指定其它配置文件）。
+- 如果 `target/release/corplink-rs` 不存在，自动执行 `cargo build --release`。
+- 用 `sudo` 后台启动 `corplink-rs`，并等待检查目标路由走到配置里的 `interface_name`。检查目标会从 `managed_routes` 自动推导：优先使用 `github_meta` 对应的 `github.com`，否则使用第一个 `dns_hosts` host。日志写入 `.run/corplink-traffic.log`。
+
+本机需要有 `git`、`python3`、Rust/Cargo、Go、`make`、`clang`/libclang、`route`、`ifconfig`、`sudo`。测试 GitHub 时需要已经配置好能访问目标仓库的 SSH key；测试 Redshift 端口时需要本机有 `nc`。
+
+首次使用前需要先准备 `libwg`：
+
+```bash
+cd libwg
+./build.sh
+cd ..
+```
+
+然后从模板创建本机配置：
+
+```bash
+cp config.template.json config.local.json
+```
+
+`config.template.json` 是可提交模板；`config.local.json` 是本机真实配置，已经被 `.gitignore` 忽略，不应该提交。模板已经包含 GitHub 和 Redshift 的 managed routes，只需要把公司、账号、密码和 Redshift endpoint 换成自己的值；如果暂时不用 Redshift，就删除 `redshift-prod` 这一段 source：
+
+```json
+{
+  "company_name": "company code name",
+  "username": "your_name",
+  "password": "your_real_password",
+  "platform": "feilian",
+  "interface_name": "utun12345",
+  "use_vpn_dns": false,
+  "auto_setup_routes": true,
+  "route_mode": "split",
+  "vpn_select_strategy": "latency",
+  "managed_routes": {
+    "enabled": true,
+    "stale_ttl_secs": 86400,
+    "include_ipv6": false,
+    "cache_file": ".run/managed-routes-cache.json",
+    "sources": [
+      {
+        "name": "github",
+        "type": "github_meta",
+        "keys": ["web", "api", "git"]
+      },
+      {
+        "name": "redshift-prod",
+        "type": "dns_hosts",
+        "hosts": ["your-cluster.region.redshift.amazonaws.com"],
+        "port": 5439
+      }
+    ]
+  }
+}
+```
+
+`platform` 和 `password` 的关系：
+
+- `platform: "feilian"`：`password` 可以填真实密码；客户端会在登录前自动转成 sha256。也支持直接填 64 位 sha256 hex。
+- `platform: "ldap"`：`password` 必须填真实 LDAP 密码；客户端不会做 sha256。
+- 如果公司环境只允许 LDAP 登录，把模板里的 `platform` 改成 `ldap`，`password` 仍然填真实密码。
+- 不建议用 `lark` / `OIDC` 配合 `start` 做首次登录，因为 `start` 是后台启动，扫码、邮箱验证码等交互流程不方便处理。需要交互排障时用 `foreground`。
+
+不要把自己的 `config.local.json` 原样发给同事。下面这些字段和文件是本机状态或个人凭据，每个人都应该自己生成：
+
+- `code`：登录后保存的 TOTP secret。
+- `state`：本地登录状态。
+- `device_id` / `device_name`：本机设备标识；不填时会自动生成默认值。
+- `public_key` / `private_key`：本机 WireGuard key pair；不填时首次运行会自动生成。
+- `*_cookies.json`：本地 cookie 文件。
+
+### 日常使用方式
+
+正常使用时优先走 `corplink-traffic.sh`：
+
+```bash
+scripts/corplink-traffic.sh start       # 后台启动，等待默认检查目标路由就绪
+scripts/corplink-traffic.sh status      # 查看进程、接口、检查目标路由和 managed source 摘要
+scripts/corplink-traffic.sh test-host   # 测试默认检查目标的路由；需要测 TCP 端口时加 TEST_PORT=5439
+scripts/corplink-traffic.sh restart     # 修改 config.local.json 后重启刷新路由
+scripts/corplink-traffic.sh logs        # 查看最近日志
+scripts/corplink-traffic.sh logs -f     # 跟随日志
+scripts/corplink-traffic.sh stop        # 停止后台进程
+```
+
+GitHub repo 访问测试需要显式传入要检查的仓库；脚本不内置默认仓库：
+
+```bash
+TEST_REPO=git@github.com:owner/repo.git scripts/corplink-traffic.sh test
+```
+
+Redshift 端口测试。`dns_hosts` source 已经配置 `port: 5439` 时，不需要再写 host：
+
+```bash
+TEST_PORT=5439 scripts/corplink-traffic.sh test-host
+```
+
+`TEST_HOST` 不是配置项，只是临时排查用的覆盖值。只有当你想临时检查一个没有写进 `managed_routes` 的目标时才需要它：
+
+```bash
+TEST_HOST=other.example.com TEST_PORT=443 scripts/corplink-traffic.sh test-host
+```
+
+常用环境变量：
+
+```bash
+CORPLINK_CONFIG=/path/to/config.json scripts/corplink-traffic.sh start
+CORPLINK_BIN=/path/to/corplink-rs scripts/corplink-traffic.sh start
+RUST_LOG=debug scripts/corplink-traffic.sh foreground
+```
+
+Redshift 需要填写具体 cluster/workgroup endpoint。`dns_hosts` 会用 DNS-over-HTTPS 解析真实 A/AAAA 记录，避免本机 Surge fake-IP DNS 返回 `198.18.0.0/15` 假地址。`DOMAIN-SUFFIX,redshift.amazonaws.com,"🏢 公司网络"` 这类 Surge 规则只能做应用层分流；真正让流量走公司出口的是 `managed_routes` 解析出的 IP route。不要把 AWS 全量 IP ranges 加进 VPN，除非你明确希望接管其它 AWS 流量。
+
+`managed_routes` 的解析结果会写入 `.run/managed-routes-cache.json`。当某个 source 临时解析失败时，未超过 `stale_ttl_secs` 且 source 输入完全匹配的旧结果会继续使用；首次启动且没有可用 cache 时会失败并指出具体 source。当前 `wg-corplink` 的系统 route UAPI 只支持添加 route，不支持删除旧 route，因此 managed routes 在启动时解析，目标 IP 变化后需要重启进程刷新。
+
+如果只想检查解析结果，不要使用会输出整份配置的旧脚本，使用：
+
+```bash
+scripts/update-managed-routes.py config.local.json --dry-run
+```
+
+`--dry-run` 只打印解析结果，不写 `.run/managed-routes-cache.json`；需要预先刷新 cache 时显式加 `--write-cache`。
 
 ## windows 使用说明
 
@@ -147,8 +294,8 @@ RUST_LOG=debug ./corplink-rs config.json
 {
   "company_name": "company code name",
   "username": "your_name",
-  "password": "your_pass",
-  "platform": "ldap"
+  "password": "your_real_password",
+  "platform": "feilian"
 }
 ```
 
@@ -158,12 +305,15 @@ RUST_LOG=debug ./corplink-rs config.json
 {
   "company_name": "company code name",
   "username": "your_name",
-  // support sha256sum hashed pass if you don't use ldap, will ask email for code if not provided
+  // feilian: real password or 64-char sha256 hex; real password will be hashed before login.
+  // ldap: real LDAP password; no sha256 conversion.
+  // if not provided, feilian may fall back to email code when the server supports it.
   "password": "your_pass",
   // default is feilian, can be feilian/ldap/lark(aka feishu)/OIDC
   // dingtalk/aad/weixin is not supported yet
-  "platform": "ldap",
-  "code": "totp code",
+  "platform": "feilian",
+  // local TOTP secret saved after login; do not copy this from another machine
+  "code": "totp secret",
   // default is DollarOS(not CentOS)
   "device_name": "any string to describe your device",
   "device_id": "md5 of device_name or any string with same format",
@@ -205,6 +355,32 @@ RUST_LOG=debug ./corplink-rs config.json
   // VPN, and for excluding the VPN peer endpoint IP to avoid a routing loop
   // that would otherwise black-hole all traffic.
   "vpn_disallowed_routes": ["192.168.1.0/24"],
+  // optional: append public SaaS CIDRs or bare IPs to AllowedIPs.
+  // with auto_setup_routes=true, these entries are also installed as system routes.
+  // useful for fixed manual overrides. Automated targets should use managed_routes.
+  "extra_allowed_ips": ["140.82.112.0/20", "20.205.243.166/32"],
+  // optional: resolve public SaaS targets into routes at startup.
+  // github_meta reads GitHub's Meta API; dns_hosts resolves explicit hostnames
+  // such as Redshift cluster/workgroup endpoints.
+  "managed_routes": {
+    "enabled": true,
+    "stale_ttl_secs": 86400,
+    "include_ipv6": false,
+    "cache_file": ".run/managed-routes-cache.json",
+    "sources": [
+      {
+        "name": "github",
+        "type": "github_meta",
+        "keys": ["web", "api", "git"]
+      },
+      {
+        "name": "redshift-prod",
+        "type": "dns_hosts",
+        "hosts": ["your-cluster.region.redshift.amazonaws.com"],
+        "port": 5439
+      }
+    ]
+  },
   // optional: run entirely in userspace (gVisor netstack) and expose a SOCKS5
   // proxy at this address instead of creating a kernel TUN device. No system
   // interface, routes, DNS changes or root privileges are required.

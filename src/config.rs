@@ -49,6 +49,52 @@ impl fmt::Display for RouteMode {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ManagedRoutesConfig {
+    /// Enable managed route sources. If the block is present, default is true.
+    pub enabled: Option<bool>,
+    /// Reserved for future runtime refresh. v1 resolves managed routes on startup.
+    pub refresh_interval_secs: Option<u64>,
+    /// How long cached source routes can be used when a source temporarily fails.
+    pub stale_ttl_secs: Option<i64>,
+    /// Include IPv6 routes from managed sources. Default is false.
+    pub include_ipv6: Option<bool>,
+    /// Cache file path. Relative paths are resolved next to the config file.
+    pub cache_file: Option<String>,
+    pub sources: Option<Vec<ManagedRouteSource>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ManagedRouteSource {
+    GithubMeta {
+        name: String,
+        keys: Option<Vec<String>>,
+        meta_url: Option<String>,
+    },
+    DnsHosts {
+        name: String,
+        hosts: Vec<String>,
+        port: Option<u16>,
+    },
+}
+
+impl ManagedRouteSource {
+    pub fn name(&self) -> &str {
+        match self {
+            ManagedRouteSource::GithubMeta { name, .. } => name,
+            ManagedRouteSource::DnsHosts { name, .. } => name,
+        }
+    }
+
+    pub fn source_type(&self) -> &str {
+        match self {
+            ManagedRouteSource::GithubMeta { .. } => "github_meta",
+            ManagedRouteSource::DnsHosts { .. } => "dns_hosts",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub company_name: String,
@@ -77,6 +123,12 @@ pub struct Config {
     /// Useful in full mode to punch holes for local LAN or the VPN peer IP itself,
     /// avoiding routing loops (e.g. 192.168.1.0/24, 10.0.0.5/32).
     pub vpn_disallowed_routes: Option<Vec<String>>,
+    /// Optional list of CIDRs or bare IPs to append to AllowedIPs / system routes.
+    /// Useful when the server-side split route list misses public SaaS ranges.
+    #[serde(alias = "routes")]
+    pub extra_allowed_ips: Option<Vec<String>>,
+    /// Optional managed route sources for public SaaS endpoints behind IP allowlists.
+    pub managed_routes: Option<ManagedRoutesConfig>,
     /// When set, run entirely in userspace (gVisor netstack) and expose a SOCKS5
     /// proxy at this listen address (e.g. "0.0.0.0:1080" or "127.0.0.1:1080")
     /// instead of creating a kernel TUN device. No system interface, routes, DNS
@@ -101,7 +153,7 @@ impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match serde_json::to_string_pretty(self) {
             Ok(s) => write!(f, "{}", s),
-            Err(e) => write!(f, "<invalid config: {e}>")
+            Err(e) => write!(f, "<invalid config: {e}>"),
         }
     }
 }

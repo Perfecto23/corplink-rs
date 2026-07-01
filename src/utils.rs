@@ -1,12 +1,12 @@
 use std::io::{self, BufRead};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use aes::Aes256;
 use base32::Alphabet;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as base64;
+use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
 use rand::rngs::OsRng;
 use sha1::{Digest, Sha1};
@@ -22,8 +22,7 @@ pub async fn read_line() -> Result<String> {
 }
 
 pub fn b32_decode(s: &str) -> Result<Vec<u8>> {
-    base32::decode(Alphabet::RFC4648 { padding: true }, s)
-        .context("failed to decode base32")
+    base32::decode(Alphabet::RFC4648 { padding: true }, s).context("failed to decode base32")
 }
 
 pub fn gen_wg_keypair() -> (String, String) {
@@ -36,7 +35,7 @@ pub fn gen_wg_keypair() -> (String, String) {
 pub fn gen_public_key_from_private(private_key: &String) -> Result<String> {
     let key = base64
         .decode(private_key)
-        .with_context(|| format!("failed to base64 decode private key {private_key}"))?;
+        .context("failed to base64 decode private key")?;
     let key: [u8; 32] = key
         .try_into()
         .map_err(|_| anyhow!("private key has invalid length"))?;
@@ -48,7 +47,7 @@ pub fn gen_public_key_from_private(private_key: &String) -> Result<String> {
 pub fn b64_decode_to_hex(s: &str) -> Result<String> {
     let data = base64
         .decode(s)
-        .with_context(|| format!("failed to base64 decode string {s}"))?;
+        .context("failed to base64 decode wireguard key")?;
     let mut hex = String::new();
     for c in data {
         hex.push_str(format!("{c:02x}").as_str());
@@ -77,6 +76,32 @@ pub fn feilian_v1_encrypt_password(password: &str) -> String {
     hex::encode(ct)
 }
 
+pub fn normalize_route(route: &str) -> Result<String> {
+    let route = route.trim();
+    if route.is_empty() {
+        bail!("route is empty");
+    }
+    if let Some((addr, prefix)) = route.split_once('/') {
+        let ip: IpAddr = addr
+            .parse()
+            .with_context(|| format!("invalid route address {addr:?}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .with_context(|| format!("invalid route prefix {prefix:?}"))?;
+        let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max_prefix {
+            bail!("route prefix {prefix} exceeds max prefix {max_prefix} for {ip}");
+        }
+        Ok(format!("{ip}/{prefix}"))
+    } else {
+        let ip: IpAddr = route
+            .parse()
+            .with_context(|| format!("invalid route address {route:?}"))?;
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+        Ok(format!("{ip}/{prefix}"))
+    }
+}
+
 /// Returns a list of CIDR strings covering all addresses in `outer` except those in `inner`.
 ///
 /// - Disjoint (no overlap) → `[outer]` unchanged.
@@ -100,9 +125,7 @@ pub fn subtract_cidr_from_cidr(outer: &str, inner: &str) -> Vec<String> {
         return vec![outer.to_string()];
     }
     // inner covers outer (inner prefix is shorter or equal and contains outer's base)
-    if inner_prefix <= outer_prefix
-        && cidr_contains_ip(inner_base, inner_prefix, outer_base)
-    {
+    if inner_prefix <= outer_prefix && cidr_contains_ip(inner_base, inner_prefix, outer_base) {
         return Vec::new();
     }
     // outer doesn't contain inner → disjoint
@@ -111,7 +134,13 @@ pub fn subtract_cidr_from_cidr(outer: &str, inner: &str) -> Vec<String> {
     }
     // outer strictly contains inner, carve by recursive bisection
     let host_bits = host_bit_count(outer_base);
-    carve_recursive(outer_base, outer_prefix, host_bits, inner_base, inner_prefix)
+    carve_recursive(
+        outer_base,
+        outer_prefix,
+        host_bits,
+        inner_base,
+        inner_prefix,
+    )
 }
 
 fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
@@ -139,11 +168,19 @@ fn same_family(a: IpAddr, b: IpAddr) -> bool {
 }
 
 fn mask_v4(prefix: u8) -> u32 {
-    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) }
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
 }
 
 fn mask_v6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) }
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
 }
 
 fn canonicalize(ip: IpAddr, prefix: u8) -> IpAddr {
@@ -172,12 +209,18 @@ fn split_half(base: IpAddr, prefix: u8) -> (IpAddr, IpAddr) {
         IpAddr::V4(b) => {
             let bu = u32::from(b);
             let bit = 1u32 << (31 - prefix);
-            (IpAddr::V4(Ipv4Addr::from(bu)), IpAddr::V4(Ipv4Addr::from(bu | bit)))
+            (
+                IpAddr::V4(Ipv4Addr::from(bu)),
+                IpAddr::V4(Ipv4Addr::from(bu | bit)),
+            )
         }
         IpAddr::V6(b) => {
             let bu = u128::from(b);
             let bit = 1u128 << (127 - prefix);
-            (IpAddr::V6(Ipv6Addr::from(bu)), IpAddr::V6(Ipv6Addr::from(bu | bit)))
+            (
+                IpAddr::V6(Ipv6Addr::from(bu)),
+                IpAddr::V6(Ipv6Addr::from(bu | bit)),
+            )
         }
     }
 }
@@ -228,11 +271,19 @@ mod tests {
         let prefix: u8 = prefix_s.parse().expect("bad prefix in test helper");
         match (base, addr) {
             (IpAddr::V4(b), IpAddr::V4(a)) => {
-                let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
                 (u32::from(b) & mask) == (u32::from(a) & mask)
             }
             (IpAddr::V6(b), IpAddr::V6(a)) => {
-                let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
                 (u128::from(b) & mask) == (u128::from(a) & mask)
             }
             _ => false,
@@ -243,6 +294,25 @@ mod tests {
     fn subtract_disjoint_returns_outer_unchanged() {
         let out = subtract_cidr_from_cidr("10.0.0.0/24", "192.168.0.0/16");
         assert_eq!(out, vec!["10.0.0.0/24"]);
+    }
+
+    #[test]
+    fn normalize_route_adds_host_prefixes_and_preserves_cidrs() {
+        assert_eq!(
+            normalize_route("20.205.243.166").unwrap(),
+            "20.205.243.166/32"
+        );
+        assert_eq!(normalize_route("2001:db8::1").unwrap(), "2001:db8::1/128");
+        assert_eq!(
+            normalize_route("140.82.112.0/20").unwrap(),
+            "140.82.112.0/20"
+        );
+    }
+
+    #[test]
+    fn normalize_route_rejects_bad_prefixes() {
+        let err = normalize_route("20.205.243.166/129").expect_err("invalid prefix should fail");
+        assert!(err.to_string().contains("exceeds max prefix"));
     }
 
     #[test]
@@ -306,7 +376,11 @@ mod tests {
         assert_eq!(out.len(), 32);
         let host: IpAddr = "1.2.3.4".parse().unwrap();
         for cidr in &out {
-            assert!(!cidr_contains_addr(cidr, host), "{} should not cover 1.2.3.4", cidr);
+            assert!(
+                !cidr_contains_addr(cidr, host),
+                "{} should not cover 1.2.3.4",
+                cidr
+            );
         }
     }
 
