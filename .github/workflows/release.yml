@@ -8,6 +8,9 @@ on:
       - "test-release"
       - "[0-9]+\\.[0-9]+"
 
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: create-release
@@ -29,6 +32,15 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+      - name: create Arch source archive
+        shell: bash
+        run: |
+          pkgver="$(awk -F= '$1 == "pkgver" {print $2; exit}' pack/PKGBUILD)"
+          git archive \
+            --format=tar.gz \
+            --prefix="corplink-rs-${pkgver}/" \
+            --output="pack/corplink-rs.${pkgver}.tar.gz" \
+            HEAD
       - name: build package
         id: build_package
         uses: PinkD/arch-pkgbuild-builder@v2.4
