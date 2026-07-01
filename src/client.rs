@@ -28,7 +28,7 @@ use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
-const COOKIE_FILE_SUFFIX: &str = "cookies.json";
+const COOKIE_FILE_SUFFIX: &str = "cookies.jsonl";
 const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 10; en)";
 
 #[derive(Clone)]
@@ -78,25 +78,10 @@ impl Client {
             .interface_name
             .clone()
             .context("interface name missing in config")?;
-        let dir = match path::Path::new(&f).parent() {
-            Some(dir) => dir,
-            None => path::Path::new("."),
-        };
-        let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
+        let cookie_file = cookie_file_path(&f, &interface_name, COOKIE_FILE_SUFFIX);
         log::info!("cookie file is: {}", cookie_file.to_string_lossy());
 
-        let mut cookie_store = {
-            let file = fs::File::open(&cookie_file).map(io::BufReader::new);
-            match file {
-                Ok(file) => CookieStore::load_json_all(file).or_else(|e| {
-                    bail!(
-                        "failed to load cookie store from {}: {e}",
-                        cookie_file.display()
-                    )
-                })?,
-                Err(_) => CookieStore::default(),
-            }
-        };
+        let mut cookie_store = load_cookie_store(&cookie_file)?;
         let has_expired = cookie_store.iter_any().any(|cookie| cookie.is_expired());
         if has_expired {
             log::info!("some cookies are expired");
@@ -163,13 +148,24 @@ impl Client {
             .interface_name
             .as_ref()
             .context("interface name missing in config")?;
+        let conf_file = self
+            .conf
+            .conf_file
+            .as_ref()
+            .context("config file path missing")?;
+        let cookie_file = cookie_file_path(conf_file, interface_name, COOKIE_FILE_SUFFIX);
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .append(false)
-            .open(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX))
+            .truncate(true)
+            .open(&cookie_file)
             .map(io::BufWriter::new)
-            .with_context(|| "failed to open cookie file for writing")?;
+            .with_context(|| {
+                format!(
+                    "failed to open cookie file for writing: {}",
+                    cookie_file.display()
+                )
+            })?;
         let c = self
             .cookie
             .lock()
@@ -1159,6 +1155,27 @@ impl Client {
     }
 }
 
+fn cookie_file_path(conf_file: &str, interface_name: &str, suffix: &str) -> path::PathBuf {
+    let dir = path::Path::new(conf_file)
+        .parent()
+        .unwrap_or_else(|| path::Path::new("."));
+    dir.join(format!("{interface_name}_{suffix}"))
+}
+
+fn load_cookie_store(cookie_file: &path::Path) -> Result<CookieStore> {
+    match fs::File::open(cookie_file).map(io::BufReader::new) {
+        Ok(file) => CookieStore::load_json_all(file).or_else(|e| {
+            bail!(
+                "failed to load cookie store from {}: {e}",
+                cookie_file.display()
+            )
+        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(CookieStore::default()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to open cookie file {}", cookie_file.display())),
+    }
+}
+
 fn append_extra_allowed_ips(
     allowed_ips: &mut Vec<String>,
     extra_allowed_ips: Option<&Vec<String>>,
@@ -1245,5 +1262,19 @@ mod tests {
             .expect_err("invalid prefix should fail");
 
         assert!(err.to_string().contains("invalid extra_allowed_ips entry"));
+    }
+
+    #[test]
+    fn cookie_file_path_uses_config_parent_and_suffix() {
+        let path = cookie_file_path(
+            "/tmp/corplink/config.local.json",
+            "utun12345",
+            "cookies.jsonl",
+        );
+
+        assert_eq!(
+            path,
+            path::PathBuf::from("/tmp/corplink/utun12345_cookies.jsonl")
+        );
     }
 }

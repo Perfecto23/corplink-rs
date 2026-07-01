@@ -26,8 +26,7 @@ const URL_OPERATE_VPN: &str = "{{url}}/vpn/report?os={{os}}&os_version={{version
 const URL_OTP: &str = "{{url}}/api/v2/p/otp?os={{os}}&os_version={{version}}";
 // log out the current terminal so it frees the server-side session/terminal
 // quota. logout_all=false only signs out this device. responds with a 302.
-const URL_LOGOUT: &str =
-    "{{url}}/api/logout?os={{os}}&os_version={{version}}&logout_all=false";
+const URL_LOGOUT: &str = "{{url}}/api/logout?os={{os}}&os_version={{version}}&logout_all=false";
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum ApiName {

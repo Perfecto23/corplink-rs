@@ -6,6 +6,27 @@
 
 `libwg/` 包含 vendored `wireguard-go` 与本地构建脚本；`config.template.json` 是可提交配置模板，`config.local.json` 是被忽略的本机真实配置；`scripts/` 放启动、验证和 managed routes 辅助脚本；`systemd/` 放 Linux service 示例；`pack/` 放打包元数据。
 
+## Agent 快速上下文
+
+优先阅读这些核心代码：`src/main.rs` 负责加载配置并进入客户端流程；`src/config.rs` 定义配置 schema；`src/client.rs` 负责登录、VPN 选择、AllowedIPs 合并和启动 WireGuard；`src/managed_routes.rs` 解析 GitHub Meta / DNS host 白名单路由并处理 cache fallback；`src/utils.rs` 放 CIDR/route 工具；`scripts/corplink-traffic.sh` 是 macOS 本地启动与验证入口。
+
+快速跑通的最短路径是：
+
+```bash
+cd libwg && ./build.sh && cd ..
+cargo build --release
+cp config.template.json config.local.json
+$EDITOR config.local.json
+scripts/update-managed-routes.py config.local.json --dry-run
+scripts/corplink-traffic.sh start
+```
+
+`start`、`foreground`、`restart`、`stop` 会触发真实 VPN 进程和 `sudo`，只有在用户明确要求运行本机 VPN 时执行。普通代码/文档验证优先使用 `cargo test`、`cargo build --release`、`bash -n scripts/corplink-traffic.sh`、`python3 -m py_compile scripts/*.py` 和 `scripts/update-managed-routes.py ... --dry-run`。
+
+必须配置项包括 `company_name`、`username`、`password`、`platform`、`interface_name`。要让 GitHub/Redshift 这类白名单目标走 VPN，必须配置 `managed_routes.enabled=true` 和至少一个 `sources`：GitHub 用 `type: "github_meta"`；Redshift 用 `type: "dns_hosts"`、`hosts` 和 `port: 5439`。真实 endpoint、账号密码、TOTP、cookie、WireGuard key 只应出现在本机 `config.local.json` 或本地状态文件中。
+
+`*_cookies.jsonl` 由 `cookie_store` crate 自动生成，实际是 JSONL cookie store，一行一条 cookie 记录，不是整体 JSON 配置文件，也不是浏览器 cookie 导出文件。不要手动编辑、格式化或复制给别人。
+
 ## 构建、测试与本地运行命令
 
 - `cd libwg && ./build.sh && cd ..`：首次构建本地 `libwg` 静态库和头文件。
@@ -32,6 +53,12 @@ bash -n scripts/corplink-traffic.sh
 ```
 
 涉及启动脚本或系统路由时，再用 `scripts/corplink-traffic.sh status` 和 `test-host` 做本机验证。
+
+## 文档与分发一致性
+
+迁移、删除或重命名示例配置和模板文件时，必须同步检查 `.github/`、`pack/`、`systemd/`、`scripts/`、README 中的旧路径引用。例如 `config/config.json` 改为 `config.template.json` 时，release workflow 仍应把模板打包成产物内的 `config.json`。
+
+README 中描述脚本环境变量、自动推导或测试命令时，必须用最小临时配置验证代表性命令。涉及 `managed_routes` 时，确认文档里的 `TEST_HOST`、`TEST_PORT`、`dns_hosts.port` 与脚本实际选择目标一致。
 
 ## 提交与 PR 规范
 

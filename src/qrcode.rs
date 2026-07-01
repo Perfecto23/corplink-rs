@@ -24,7 +24,9 @@ impl TerminalQrCode {
             }
             v += QR_VERSION_STEP;
         }
-        Err(anyhow::anyhow!("data too long for QR code (max version {QR_MAX_VERSION})"))
+        Err(anyhow::anyhow!(
+            "data too long for QR code (max version {QR_MAX_VERSION})"
+        ))
     }
 
     pub fn print(&self) {
