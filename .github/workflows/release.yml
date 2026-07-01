@@ -6,7 +6,8 @@ on:
       - master
     tags:
       - "test-release"
-      - "[0-9]+\\.[0-9]+"
+      - "[0-9]*.[0-9]*"
+      - "v[0-9]*.[0-9]*"
 
 permissions:
   contents: write
@@ -20,8 +21,8 @@ jobs:
         uses: actions/create-release@v1
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -58,7 +59,7 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: pack/corplink-rs-${{ github.ref_name }}*.pkg.tar.zst
-          tag: ${{ github.ref }}
+          tag: ${{ github.ref_name }}
           overwrite: true
           file_glob: true
       - name: create tarball
@@ -77,7 +78,7 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: corplink-rs-${{ github.ref_name }}*.tar.gz
-          tag: ${{ github.ref }}
+          tag: ${{ github.ref_name }}
           overwrite: true
           file_glob: true
 
@@ -113,7 +114,7 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: target/corplink-rs-*.tar.gz
-          tag: ${{ github.ref }}
+          tag: ${{ github.ref_name }}
           overwrite: true
           file_glob: true
 
@@ -153,6 +154,6 @@ jobs:
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: corplink-rs-${{ github.ref_name }}-windows.zip
-          tag: ${{ github.ref }}
+          tag: ${{ github.ref_name }}
           overwrite: true
           file_glob: true
