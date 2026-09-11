@@ -10,8 +10,11 @@ WorkingDirectory=/etc/corplink
 Type=simple
 ExecStart=/usr/bin/corplink-rs /etc/corplink/config.json
 KillSignal=SIGINT
+# Handled failures exit 1 and must stay stopped; panic exits and abnormal
+# signals remain eligible for bounded systemd recovery.
 Restart=on-failure
-RestartSec=60s
+RestartPreventExitStatus=1
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target

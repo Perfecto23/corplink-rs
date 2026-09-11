@@ -1,10 +1,12 @@
 use std::fmt;
+use std::path::PathBuf;
 use tokio::fs;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::state::State;
+use crate::state::{self, SessionState, State};
 use crate::utils;
 
 const DEFAULT_DEVICE_NAME: &str = "DollarOS";
@@ -111,6 +113,10 @@ pub struct Config {
     pub debug_wg: Option<bool>,
     #[serde(skip_serializing)]
     pub conf_file: Option<String>,
+    #[serde(skip)]
+    pub(crate) legacy_cookie_migration: bool,
+    #[serde(skip)]
+    pub(crate) declared_server: Option<String>,
     pub state: Option<State>,
     pub vpn_server_name: Option<String>,
     pub vpn_select_strategy: Option<String>,
@@ -159,23 +165,95 @@ impl fmt::Display for Config {
 }
 
 impl Config {
-    pub async fn from_file(file: &str) -> Result<Config> {
+    /// Parse a user configuration and bind its source path without applying
+    /// defaults, generating keys, or touching any sidecar/state file.
+    pub async fn read_only(file: &str) -> Result<Config> {
         let conf_str = fs::read_to_string(file)
             .await
             .with_context(|| format!("failed to read config file {file}"))?;
-
-        let mut conf: Config = serde_json::from_str(&conf_str[..])
+        let mut conf: Config = serde_json::from_str(&conf_str)
             .with_context(|| format!("failed to parse config file {file}"))?;
-
         conf.conf_file = Some(file.to_string());
-        let mut update_conf = false;
+        conf.declared_server = conf.server.clone();
+        Ok(conf)
+    }
+
+    pub async fn from_file(file: &str) -> Result<Config> {
+        let mut conf = Self::read_only(file).await?;
+        let mut update_session = false;
         if conf.interface_name.is_none() {
             conf.interface_name = Some(DEFAULT_INTERFACE_NAME.to_string());
-            update_conf = true;
+            update_session = true;
         }
+
+        let interface_name = conf
+            .interface_name
+            .as_deref()
+            .context("interface name missing after applying default")?;
+        let session_path = state::session_file_path(file, interface_name);
+        conf.legacy_cookie_migration = !session_path.exists()
+            && (conf.state.is_some()
+                || conf.device_name.is_some()
+                || conf.device_id.is_some()
+                || conf.public_key.is_some()
+                || conf.private_key.is_some()
+                || conf.code.is_some());
+        let loaded_session = state::load_session(&session_path).with_context(|| {
+            format!(
+                "failed to read authentication session state {}",
+                session_path.display()
+            )
+        })?;
+        let session_corrupt = session_path.exists() && loaded_session.is_none();
+        let identity = conf.session_identity_tag();
+        let session_stale = loaded_session
+            .as_ref()
+            .map(|session| session.identity.as_deref() != Some(identity.as_str()))
+            .unwrap_or(false);
+        let session_usable = loaded_session.is_some() && !session_corrupt && !session_stale;
+        let private_key_was_explicit = conf.private_key.is_some();
+        let public_key_was_explicit = conf.public_key.is_some();
+        if session_corrupt {
+            // Treat a damaged sidecar as an expired session. Keep the file for
+            // forensics and write a fresh state only after all in-memory
+            // defaults below have been resolved.
+            log::warn!("authentication session state is unreadable; requiring login");
+            conf.state = Some(State::Init);
+        } else if session_stale {
+            log::warn!("authentication session belongs to a different config; requiring login");
+            conf.state = Some(State::Init);
+        }
+
+        if session_usable {
+            let session = loaded_session.expect("usable session must be present");
+            let session_public_key_matches =
+                session.public_key.as_ref() == conf.public_key.as_ref();
+            conf.legacy_cookie_migration |= session.legacy_cookie_migration;
+            if conf.device_name.is_none() {
+                conf.device_name = session.device_name;
+            }
+            if conf.device_id.is_none() {
+                conf.device_id = session.device_id;
+            }
+            if conf.public_key.is_none() && !private_key_was_explicit {
+                conf.public_key = session.public_key;
+            }
+            if conf.private_key.is_none()
+                && (!public_key_was_explicit || session_public_key_matches)
+            {
+                conf.private_key = session.private_key;
+            }
+            if conf.code.is_none() {
+                conf.code = session.code;
+            }
+            // State describes the current authentication session, so the
+            // sidecar is authoritative whenever it is valid.
+            conf.state = Some(session.state);
+        }
+
         if conf.device_name.is_none() {
             conf.device_name = Some(DEFAULT_DEVICE_NAME.to_string());
-            update_conf = true;
+            update_session = true;
         }
         if conf.device_id.is_none() {
             let device_name = conf
@@ -183,7 +261,7 @@ impl Config {
                 .as_ref()
                 .context("device name missing when generating device id")?;
             conf.device_id = Some(format!("{:x}", md5::compute(device_name)));
-            update_conf = true;
+            update_session = true;
         }
         match &conf.private_key {
             Some(private_key) => match conf.public_key {
@@ -194,32 +272,108 @@ impl Config {
                     // only private key exists, generate public from private
                     let public_key = utils::gen_public_key_from_private(private_key)?;
                     conf.public_key = Some(public_key);
-                    update_conf = true;
+                    update_session = true;
                 }
             },
             None => {
+                if public_key_was_explicit {
+                    return Err(anyhow::Error::new(
+                        crate::api::ClientFailure::configuration("wireguard key pair"),
+                    ));
+                }
                 // no key exists, generate new
                 let (public_key, private_key) = utils::gen_wg_keypair();
                 (conf.public_key, conf.private_key) = (Some(public_key), Some(private_key));
-                update_conf = true;
+                update_session = true;
             }
         }
-        if update_conf {
-            conf.save().await?;
+
+        if conf.state.is_none() {
+            conf.state = Some(State::Init);
+            update_session = true;
+        }
+        if !session_path.exists() {
+            update_session = true;
+        }
+        if update_session && (!session_path.exists() || session_usable) {
+            conf.save_session().await?;
         }
         Ok(conf)
     }
 
-    pub async fn save(&self) -> Result<()> {
+    pub fn session_path(&self) -> Result<PathBuf> {
         let file = self
             .conf_file
             .as_ref()
             .context("config file path missing")?;
-        let data = format!("{}", &self);
-        fs::write(file, data)
-            .await
-            .with_context(|| format!("failed to write config file {file}"))?;
-        Ok(())
+        let interface_name = self
+            .interface_name
+            .as_deref()
+            .unwrap_or(DEFAULT_INTERFACE_NAME);
+        Ok(state::session_file_path(file, interface_name))
+    }
+
+    /// Return whether a persisted session belongs to this config identity.
+    /// Missing sidecars are treated as legacy-compatible: old config files may
+    /// still carry their own device/key/state fields and can migrate on save.
+    pub fn session_identity_matches(&self) -> Result<bool> {
+        let path = self.session_path()?;
+        if !path.exists() {
+            return Ok(true);
+        }
+        Ok(state::load_session(&path)?
+            .and_then(|session| session.identity)
+            .map(|identity| identity == self.session_identity_tag())
+            .unwrap_or(false))
+    }
+
+    pub fn session_snapshot(&self) -> SessionState {
+        SessionState {
+            identity: Some(self.session_identity_tag()),
+            legacy_cookie_migration: self.legacy_cookie_migration,
+            state: self.state.clone().unwrap_or_default(),
+            device_name: self.device_name.clone(),
+            device_id: self.device_id.clone(),
+            public_key: self.public_key.clone(),
+            private_key: self.private_key.clone(),
+            code: self.code.clone(),
+        }
+    }
+
+    pub(crate) fn session_identity_tag(&self) -> String {
+        let file = self.conf_file.as_deref().unwrap_or_default();
+        let platform = self.platform.as_deref().unwrap_or_default();
+        let server = self.declared_server.as_deref().unwrap_or_default();
+        let material = format!(
+            "{file}\n{}\n{}\n{platform}\n{server}",
+            self.company_name, self.username
+        );
+        let digest = Sha256::digest(material.as_bytes());
+        format!("{digest:x}")
+    }
+
+    pub(crate) fn allow_legacy_cookie_migration(&self) -> bool {
+        self.legacy_cookie_migration
+    }
+
+    pub async fn save_session(&self) -> Result<()> {
+        let path = self.session_path()?;
+        state::save_session(&path, &self.session_snapshot()).with_context(|| {
+            format!(
+                "failed to persist authentication session state {}",
+                path.display()
+            )
+        })
+    }
+
+    pub fn save_session_sync(&self) -> Result<()> {
+        let path = self.session_path()?;
+        state::save_session(&path, &self.session_snapshot()).with_context(|| {
+            format!(
+                "failed to persist authentication session state {}",
+                path.display()
+            )
+        })
     }
 }
 
@@ -241,4 +395,126 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn test_config_path(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("corplink-config-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("config.json")
+    }
+
+    #[tokio::test]
+    async fn read_only_parses_and_binds_without_generating_or_writing() {
+        let path = test_config_path("read-only");
+        let source = br#"{"company_name":"company","username":"user"}"#;
+        fs::write(&path, source).unwrap();
+
+        let config = Config::read_only(path.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(config.conf_file.as_deref(), path.to_str());
+        assert!(config.interface_name.is_none());
+        assert!(config.public_key.is_none());
+        assert!(config.private_key.is_none());
+        assert_eq!(fs::read(&path).unwrap(), source);
+        assert!(!crate::state::session_file_path(path.to_str().unwrap(), "corplink").exists());
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn from_file_keeps_user_file_unchanged_and_persists_runtime_defaults() {
+        let path = test_config_path("from-file");
+        let source = br#"{"company_name":"company","username":"user"}"#;
+        fs::write(&path, source).unwrap();
+
+        let config = Config::from_file(path.to_str().unwrap()).await.unwrap();
+        let session_path = crate::state::session_file_path(path.to_str().unwrap(), "corplink");
+        let session = crate::state::load_session(&session_path).unwrap().unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), source);
+        assert_eq!(config.interface_name.as_deref(), Some("corplink"));
+        assert_eq!(config.state, Some(State::Init));
+        assert_eq!(session.state, State::Init);
+        assert_eq!(session.public_key, config.public_key);
+        assert_eq!(session.private_key, config.private_key);
+        assert_eq!(session.device_id, config.device_id);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_session_is_preserved_and_requires_login() {
+        let path = test_config_path("corrupt-session");
+        let source = br#"{"company_name":"company","username":"user"}"#;
+        fs::write(&path, source).unwrap();
+        let session_path = crate::state::session_file_path(path.to_str().unwrap(), "corplink");
+        let corrupt = b"session-secret-and-not-json";
+        fs::write(&session_path, corrupt).unwrap();
+
+        let config = Config::from_file(path.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(config.state, Some(State::Init));
+        assert_eq!(fs::read(&path).unwrap(), source);
+        assert_eq!(fs::read(&session_path).unwrap(), corrupt);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_identity_prevents_cross_account_reuse() {
+        let path = test_config_path("identity");
+        let first = br#"{"company_name":"company","username":"first"}"#;
+        fs::write(&path, first).unwrap();
+        let first_config = Config::from_file(path.to_str().unwrap()).await.unwrap();
+        let session_path = crate::state::session_file_path(path.to_str().unwrap(), "corplink");
+        let old_session = fs::read(&session_path).unwrap();
+
+        let second = br#"{"company_name":"company","username":"second"}"#;
+        fs::write(&path, second).unwrap();
+        let second_config = Config::from_file(path.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(second_config.state, Some(State::Init));
+        assert_ne!(second_config.public_key, first_config.public_key);
+        assert_eq!(fs::read(&session_path).unwrap(), old_session);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_private_key_derives_public_without_reusing_old_session_key() {
+        let path = test_config_path("explicit-private");
+        let source = br#"{"company_name":"company","username":"user"}"#;
+        fs::write(&path, source).unwrap();
+        let first = Config::from_file(path.to_str().unwrap()).await.unwrap();
+        let old_public = first.public_key.clone();
+        let (new_public, new_private) = crate::utils::gen_wg_keypair();
+        assert_ne!(old_public, Some(new_public.clone()));
+
+        let explicit = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"private_key\":\"{new_private}\"}}"
+        );
+        fs::write(&path, explicit).unwrap();
+        let second = Config::from_file(path.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(second.private_key, Some(new_private.clone()));
+        assert_eq!(second.public_key, Some(new_public));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovered_server_does_not_change_declared_session_identity() {
+        let path = test_config_path("discovered-server");
+        fs::write(&path, br#"{"company_name":"company","username":"user"}"#).unwrap();
+        let mut config = Config::from_file(path.to_str().unwrap()).await.unwrap();
+        config.server = Some("http://127.0.0.1:9".to_string());
+
+        assert!(config.session_identity_matches().unwrap());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 }

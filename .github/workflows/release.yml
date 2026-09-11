@@ -64,9 +64,12 @@ jobs:
           file_glob: true
       - name: create tarball
         run: |
-          cp pack/pkg/corplink-rs/usr/bin/corplink-rs .
-          cp config.template.json config.json
-          tar -czf corplink-rs-${{ github.ref_name }}-linux-$(uname -m).tar.gz corplink-rs config.json
+          bundle_dir="$(mktemp -d)"
+          cp pack/pkg/corplink-rs/usr/bin/corplink-rs "$bundle_dir/"
+          cp config.template.json "$bundle_dir/config.json"
+          cp README.md "$bundle_dir/"
+          cp -R scripts systemd "$bundle_dir/"
+          tar -czf corplink-rs-${{ github.ref_name }}-linux-$(uname -m).tar.gz -C "$bundle_dir" corplink-rs config.json README.md scripts systemd
       - name: upload tarball to artifact
         uses: actions/upload-artifact@v6
         with:
@@ -89,20 +92,24 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: setup go
         uses: actions/setup-go@v5
         with:
-          go-version: ">=1.22.0"
+          go-version-file: libwg/wireguard-go/go.mod
       - name: build libwg
         run: cd libwg && ./build.sh
       - name: build package
         run: cargo build --release
       - name: build tarball
         run: |
-          cd target
-          cp release/corplink-rs .
-          cp ../config.template.json config.json
-          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
+          bundle_dir="$(mktemp -d)"
+          cp target/release/corplink-rs "$bundle_dir/"
+          cp config.template.json "$bundle_dir/config.json"
+          cp README.md "$bundle_dir/"
+          cp -R scripts "$bundle_dir/"
+          tar -czf target/corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz -C "$bundle_dir" corplink-rs config.json README.md scripts
       - name: upload package to artifact
         uses: actions/upload-artifact@v6
         with:
@@ -125,10 +132,12 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: setup go
         uses: actions/setup-go@v5
         with:
-          go-version: ">=1.22.0"
+          go-version-file: libwg/wireguard-go/go.mod
       - name: build libwg
         run: cd libwg && ./build.ps1
       - name: rust install gnu toolchain

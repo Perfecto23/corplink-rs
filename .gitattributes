@@ -1,0 +1,2 @@
+# Unified-diff context prefixes are required syntax, including before Go tabs.
+libwg/patches/*.patch whitespace=-blank-at-eol,-space-before-tab

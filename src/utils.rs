@@ -92,13 +92,36 @@ pub fn normalize_route(route: &str) -> Result<String> {
         if prefix > max_prefix {
             bail!("route prefix {prefix} exceeds max prefix {max_prefix} for {ip}");
         }
-        Ok(format!("{ip}/{prefix}"))
+        Ok(format!("{}/{}", canonicalize_ip(ip, prefix), prefix))
     } else {
         let ip: IpAddr = route
             .parse()
             .with_context(|| format!("invalid route address {route:?}"))?;
         let prefix = if ip.is_ipv4() { 32 } else { 128 };
         Ok(format!("{ip}/{prefix}"))
+    }
+}
+
+fn canonicalize_ip(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(ip) => {
+            let bits = u32::from(ip);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            IpAddr::V4(Ipv4Addr::from(bits & mask))
+        }
+        IpAddr::V6(ip) => {
+            let bits = u128::from(ip);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            IpAddr::V6(Ipv6Addr::from(bits & mask))
+        }
     }
 }
 
@@ -306,6 +329,15 @@ mod tests {
         assert_eq!(
             normalize_route("140.82.112.0/20").unwrap(),
             "140.82.112.0/20"
+        );
+    }
+
+    #[test]
+    fn normalize_route_canonicalizes_cidr_host_bits() {
+        assert_eq!(normalize_route("192.0.2.10/24").unwrap(), "192.0.2.0/24");
+        assert_eq!(
+            normalize_route("2001:db8:1:2::42/64").unwrap(),
+            "2001:db8:1:2::/64"
         );
     }
 

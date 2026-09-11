@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
+import pathlib
+import subprocess
 import sys
 
 
 def main() -> int:
     print(
-        "deprecated: use scripts/update-managed-routes.py with managed_routes.github_meta; "
-        "this tool no longer rewrites config extra_allowed_ips",
+        "deprecated: forwarding to scripts/update-managed-routes.py; "
+        "managed_routes.github_meta is the single route source",
         file=sys.stderr,
     )
-    return 2
+    script = pathlib.Path(__file__).with_name("update-managed-routes.py")
+    return subprocess.run([sys.executable, str(script), *sys.argv[1:]], check=False).returncode
 
 
 if __name__ == "__main__":

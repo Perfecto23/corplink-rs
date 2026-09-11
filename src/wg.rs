@@ -1,5 +1,5 @@
 use std::ffi::{c_void, CStr, CString};
-use std::time;
+use std::time::{self, Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -127,6 +127,48 @@ pub struct UAPIClient {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum WgHealth {
+    Healthy(Duration),
+    NoHandshake,
+    Stale(Duration),
+}
+
+pub fn parse_wg_health(data: &[u8], stale_after: Duration) -> Result<WgHealth> {
+    let response =
+        String::from_utf8(data.to_vec()).context("failed to decode wireguard UAPI response")?;
+    let mut handshake = None;
+    for line in response.lines() {
+        if let Some(value) = line.strip_prefix("last_handshake_time_sec=") {
+            handshake = Some(
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid last_handshake_time_sec value {value:?}"))?,
+            );
+        }
+        if let Some(errno) = line.strip_prefix("errno=") {
+            if errno != "0" {
+                return Err(anyhow!("wireguard UAPI returned errno={errno}"));
+            }
+        }
+    }
+    let timestamp = handshake.context("wireguard UAPI did not return last_handshake_time_sec")?;
+    if timestamp == 0 {
+        return Ok(WgHealth::NoHandshake);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let age = now
+        .checked_sub(Duration::from_secs(timestamp))
+        .unwrap_or_default();
+    if age <= stale_after {
+        Ok(WgHealth::Healthy(age))
+    } else {
+        Ok(WgHealth::Stale(age))
+    }
+}
+
 impl UAPIClient {
     pub async fn config_wg(&mut self, conf: &config::WgConf) -> Result<()> {
         let mut buff = String::from("set=1\n");
@@ -208,6 +250,36 @@ impl UAPIClient {
         Ok(())
     }
 
+    pub fn health(&self, stale_after: Duration) -> Result<WgHealth> {
+        let data = uapi(b"get=1\n\n")
+            .with_context(|| format!("failed to query wireguard health for {}", self.name))?;
+        parse_wg_health(&data, stale_after)
+    }
+
+    pub async fn wait_for_handshake(
+        &self,
+        deadline: Duration,
+        stale_after: Duration,
+    ) -> Result<Duration> {
+        let started = tokio::time::Instant::now();
+        loop {
+            match self.health(stale_after)? {
+                WgHealth::Healthy(age) => return Ok(age),
+                WgHealth::NoHandshake => {}
+                WgHealth::Stale(age) => {
+                    log::warn!("wireguard handshake is stale: {}s", age.as_secs());
+                }
+            }
+            if started.elapsed() >= deadline {
+                return Err(anyhow!(
+                    "wireguard handshake was not observed before the {}s deadline",
+                    deadline.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     pub async fn check_wg_connection(&mut self) {
         // default refresh key timeout of wg is 2 min
         // we set wg connection timeout to 5 min
@@ -220,72 +292,69 @@ impl UAPIClient {
             ticker.tick().await;
 
             let name = self.name.as_str();
-            let data = match uapi(b"get=1\n\n") {
-                Ok(data) => data,
-                Err(e) => {
-                    log::warn!("failed to call uapi for {}: {}", name, e);
-                    continue;
+            match self.health(interval) {
+                Ok(WgHealth::Healthy(age)) => {
+                    log::info!("last handshake age for {} is {}s", name, age.as_secs());
                 }
-            };
-            let s = match String::from_utf8(data) {
-                Ok(s) => s,
+                Ok(WgHealth::NoHandshake) => {
+                    log::warn!("wireguard {} has not completed a handshake", name);
+                }
+                Ok(WgHealth::Stale(age)) => {
+                    log::warn!("last handshake for {} is stale at {}s", name, age.as_secs());
+                    timeout = true;
+                }
                 Err(err) => {
-                    log::warn!("failed to parse uapi response for {}: {}", name, err);
-                    continue;
-                }
-            };
-            for line in s.split('\n') {
-                if line.starts_with("last_handshake_time_sec") {
-                    let last = match line.trim_end().split('=').next_back() {
-                        Some(v) => v,
-                        None => {
-                            log::warn!("unexpected uapi line: {}", line);
-                            continue;
-                        }
-                    };
-                    match last.parse::<i64>() {
-                        Ok(timestamp) => {
-                            if timestamp == 0 {
-                                // do nothing because it's invalid
-                            } else if let Some(nt) = chrono::DateTime::from_timestamp(timestamp, 0)
-                            {
-                                let now = chrono::Utc::now().to_utc();
-                                let t = now - nt;
-                                let tt = nt.to_utc();
-                                let lt = tt.with_timezone(&chrono::Local);
-                                if let Ok(elapsed) = t.to_std() {
-                                    let elapsed = elapsed.as_secs_f32();
-                                    log::info!(
-                                        "last handshake is at {lt}, elapsed time {elapsed}s"
-                                    );
-                                    if let Ok(interval_dur) = chrono::Duration::from_std(interval) {
-                                        if t > interval_dur {
-                                            log::warn!(
-                                                    "last handshake is at {}, elapsed time {}s more than {}s",
-                                                    lt,
-                                                    elapsed,
-                                                    interval.as_secs()
-                                                );
-                                            timeout = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            log::warn!("parse last handshake of {} fail: {}", name, err)
-                        }
-                    }
-                    break;
-                } else if line.starts_with("errno") {
-                    if line != "errno=0" {
-                        log::warn!("uapi of {} return: fail: {}", name, line)
-                    }
-                } else if line.is_empty() {
-                    // reach end
-                    break;
+                    log::warn!("failed to observe wireguard {}: {}", name, err);
+                    timeout = true;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_handshake_is_explicitly_unhealthy() {
+        assert!(matches!(
+            parse_wg_health(
+                b"last_handshake_time_sec=0\nerrno=0\n\n",
+                Duration::from_secs(5)
+            ),
+            Ok(WgHealth::NoHandshake)
+        ));
+    }
+
+    #[test]
+    fn malformed_uapi_is_an_error_instead_of_healthy() {
+        let error = parse_wg_health(b"errno=0\n\n", Duration::from_secs(5)).unwrap_err();
+        assert!(error.to_string().contains("last_handshake_time_sec"));
+    }
+
+    #[test]
+    fn nonzero_uapi_errno_is_not_hidden_by_a_handshake_field() {
+        let error = parse_wg_health(
+            b"last_handshake_time_sec=1\nerrno=5\n\n",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("errno=5"));
+    }
+
+    #[test]
+    fn current_handshake_is_healthy() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(matches!(
+            parse_wg_health(
+                format!("last_handshake_time_sec={now}\nerrno=0\n\n").as_bytes(),
+                Duration::from_secs(5)
+            ),
+            Ok(WgHealth::Healthy(_))
+        ));
     }
 }

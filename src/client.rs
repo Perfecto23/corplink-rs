@@ -16,28 +16,58 @@ use reqwest_cookie_store::CookieStoreMutex;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use sha2::Digest;
+use tokio::io::AsyncBufReadExt;
 
-use crate::api::{ApiName, ApiUrl, URL_GET_COMPANY};
+use crate::api::{ApiName, ApiUrl, ClientFailure, URL_GET_COMPANY};
 use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
+use crate::managed_routes::RouteResolutionReport;
 use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
-use crate::state::State;
+use crate::state::{self, State};
 use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.jsonl";
 const USER_AGENT: &str = "CorpLink/201000 (GooglePixel; Android 10; en)";
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
+
+async fn wait_for_interaction(operation: &'static str) -> Result<()> {
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    match tokio::time::timeout(INTERACTION_TIMEOUT, input.read_line(&mut line)).await {
+        Ok(Ok(count)) if count > 0 => Ok(()),
+        Ok(_) | Err(_) => Err(anyhow::Error::new(ClientFailure::interaction(operation))),
+    }
+}
+
+async fn read_interactive_line(operation: &'static str) -> Result<String> {
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    match tokio::time::timeout(INTERACTION_TIMEOUT, input.read_line(&mut line)).await {
+        Ok(Ok(count)) if count > 0 => Ok(line.trim().to_string()),
+        Ok(_) | Err(_) => Err(anyhow::Error::new(ClientFailure::interaction(operation))),
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
     conf: Config,
     cookie: Arc<CookieStoreMutex>,
+    cookie_file: path::PathBuf,
+    cookie_corrupted: bool,
+    cookie_corrupted_path: Option<path::PathBuf>,
     c: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
+    managed_routes_report: Option<RouteResolutionReport>,
+}
+
+struct LoadedCookieStore {
+    store: CookieStore,
+    corrupted: bool,
 }
 
 unsafe impl Send for Client {}
@@ -59,15 +89,24 @@ pub async fn get_company_url(code: &str) -> anyhow::Result<RespCompany> {
         .body(body)
         .send()
         .await
-        .context("get company")?
+        .map_err(|_| anyhow::Error::new(ClientFailure::transport("company_match")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow::Error::new(ClientFailure::http(
+            "company_match",
+            status.as_u16(),
+        )));
+    }
+    let resp = resp
         .json::<Resp<RespCompany>>()
         .await
-        .context("parse company resp")?;
+        .map_err(|_| anyhow::Error::new(ClientFailure::protocol("company_match", None)))?;
     match resp.code {
         0 => resp.data.context("company response missing data"),
-        _ => Err(anyhow!(resp
-            .message
-            .unwrap_or_else(|| "failed to fetch company info".to_string()))),
+        _ => Err(anyhow::Error::new(ClientFailure::api(
+            "company_match",
+            resp.code,
+        ))),
     }
 }
 
@@ -78,10 +117,44 @@ impl Client {
             .interface_name
             .clone()
             .context("interface name missing in config")?;
-        let cookie_file = cookie_file_path(&f, &interface_name, COOKIE_FILE_SUFFIX);
-        log::info!("cookie file is: {}", cookie_file.to_string_lossy());
+        let identity_cookie_file = cookie_file_path_for_identity(
+            &f,
+            &interface_name,
+            &conf.session_identity_tag(),
+            COOKIE_FILE_SUFFIX,
+        );
+        let legacy_cookie_file = cookie_file_path(&f, &interface_name, COOKIE_FILE_SUFFIX);
+        log::info!("cookie file is: {}", identity_cookie_file.to_string_lossy());
 
-        let mut cookie_store = load_cookie_store(&cookie_file)?;
+        let session_identity_matches = conf
+            .session_identity_matches()
+            .context("failed to validate authentication session identity")?;
+        let (loaded_cookie_store, migrate_legacy_cookie) =
+            if session_identity_matches && identity_cookie_file.exists() {
+                (load_cookie_store(&identity_cookie_file)?, false)
+            } else if session_identity_matches
+                && conf.allow_legacy_cookie_migration()
+                && legacy_cookie_file.exists()
+            {
+                (load_cookie_store(&legacy_cookie_file)?, true)
+            } else {
+                if !session_identity_matches {
+                    log::warn!("cookie store belongs to a different config; requiring login");
+                }
+                (
+                    LoadedCookieStore {
+                        store: CookieStore::default(),
+                        corrupted: false,
+                    },
+                    false,
+                )
+            };
+        let mut cookie_store = loaded_cookie_store.store;
+        let cookie_corrupted_path = if loaded_cookie_store.corrupted && migrate_legacy_cookie {
+            Some(legacy_cookie_file.clone())
+        } else {
+            None
+        };
         let has_expired = cookie_store.iter_any().any(|cookie| cookie.is_expired());
         if has_expired {
             log::info!("some cookies are expired");
@@ -127,51 +200,61 @@ impl Client {
             .build()
             .context("build http client")?;
         let conf_bak = conf.clone();
-        Ok(Client {
+        let mut client = Client {
             conf,
             cookie: Arc::clone(&cookie_store),
+            cookie_file: identity_cookie_file,
+            cookie_corrupted: loaded_cookie_store.corrupted,
+            cookie_corrupted_path,
             c,
             api_url: ApiUrl::new(&conf_bak)?,
             date_offset_sec: 0,
-        })
+            managed_routes_report: None,
+        };
+        if loaded_cookie_store.corrupted {
+            log::warn!("cookie store is unreadable; requiring login");
+            client.conf.state = Some(State::Init);
+            client.conf.save_session_sync()?;
+        } else if migrate_legacy_cookie {
+            client.save_cookie()?;
+        }
+        Ok(client)
     }
 
     async fn change_state(&mut self, state: State) -> Result<()> {
         self.conf.state = Some(state);
-        self.conf.save().await?;
+        self.conf.save_session().await?;
         Ok(())
     }
 
-    fn save_cookie(&self) -> Result<()> {
-        let interface_name = self
-            .conf
-            .interface_name
-            .as_ref()
-            .context("interface name missing in config")?;
-        let conf_file = self
-            .conf
-            .conf_file
-            .as_ref()
-            .context("config file path missing")?;
-        let cookie_file = cookie_file_path(conf_file, interface_name, COOKIE_FILE_SUFFIX);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&cookie_file)
-            .map(io::BufWriter::new)
-            .with_context(|| {
-                format!(
-                    "failed to open cookie file for writing: {}",
-                    cookie_file.display()
-                )
-            })?;
+    fn save_cookie(&mut self) -> Result<()> {
         let c = self
             .cookie
             .lock()
             .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
-        c.save_json(&mut file)
-            .or_else(|e| bail!("failed to persist cookies to disk: {e}"))?;
+        let mut bytes = Vec::new();
+        c.save_incl_expired_and_nonpersistent_json(&mut bytes)
+            .map_err(|_| anyhow!("failed to serialize cookies for persistence"))?;
+        if self.cookie_corrupted {
+            let corrupt_path = self
+                .cookie_corrupted_path
+                .as_ref()
+                .unwrap_or(&self.cookie_file);
+            state::backup_existing_private(corrupt_path, "corrupt")?
+                .context("failed to preserve corrupt cookie store")?;
+        }
+        state::atomic_write_private(&self.cookie_file, &bytes).with_context(|| {
+            format!(
+                "failed to persist cookies to disk: {}",
+                self.cookie_file.display()
+            )
+        })?;
+        self.cookie_corrupted = false;
+        self.cookie_corrupted_path = None;
+        if self.conf.legacy_cookie_migration {
+            self.conf.legacy_cookie_migration = false;
+            self.conf.save_session_sync()?;
+        }
         Ok(())
     }
 
@@ -197,11 +280,15 @@ impl Client {
         let resp = rb
             .send()
             .await
-            .with_context(|| format!("request {api:?} failed"))?;
+            .map_err(|_| anyhow::Error::new(ClientFailure::transport(api.as_str())))?;
 
         if !resp.status().is_success() {
-            let msg = format!("logout because of bad resp code: {}", resp.status());
-            self.handle_logout_err(msg).await?;
+            let status = resp.status().as_u16();
+            let failure = ClientFailure::http(api.as_str(), status);
+            if failure.kind().requires_login() {
+                self.change_state(State::Init).await?;
+            }
+            return Err(anyhow::Error::new(failure));
         }
 
         self.parse_time_offset_from_date_header(&resp);
@@ -216,7 +303,7 @@ impl Client {
         let text = resp
             .text()
             .await
-            .with_context(|| format!("failed to read response body for api {api:?}"))?;
+            .map_err(|_| anyhow::Error::new(ClientFailure::protocol(api.as_str(), None)))?;
         // Parse the envelope generically first. When the server-side session has
         // expired the server returns a non-zero code (e.g. 101) with a `data`
         // whose shape doesn't match T (ListVPN, for instance, gets an object where
@@ -224,14 +311,12 @@ impl Client {
         // and bypass the code-based logout/retry handling, leaving a stale-session
         // run dead with a confusing parse error. So only coerce `data` into T once
         // we know code == 0; otherwise keep the code/message so callers can react.
-        let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
-            format!("failed to parse response envelope for api {api:?}: {text}")
-        })?;
+        let raw: Resp<Value> = serde_json::from_str(&text)
+            .map_err(|_| anyhow::Error::new(ClientFailure::protocol(api.as_str(), None)))?;
         let data = match (raw.code, raw.data) {
-            (0, Some(v)) => Some(
-                serde_json::from_value::<T>(v)
-                    .with_context(|| format!("failed to parse response data for api {api:?}"))?,
-            ),
+            (0, Some(v)) => Some(serde_json::from_value::<T>(v).map_err(|_| {
+                anyhow::Error::new(ClientFailure::protocol(api.as_str(), Some(raw.code)))
+            })?),
             _ => None,
         };
         let resp = Resp::<T> {
@@ -240,7 +325,7 @@ impl Client {
             data,
             action: raw.action,
         };
-        log::debug!("api {:#?} resp: {:#?}", api, resp);
+        log::debug!("api={} returned code={}", api.as_str(), resp.code);
         Ok(resp)
     }
 
@@ -286,16 +371,16 @@ impl Client {
             .request::<RespLogin>(ApiName::TpsTokenCheck, Some(m))
             .await?;
         match resp.code {
-            0 => resp
-                .data
-                .context("tps token check missing redirect url")
-                .map(|d| d.url),
-            _ => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "tps token check failed".to_string());
-                bail!(msg)
-            }
+            0 => resp.data.map(|d| d.url).ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::TpsTokenCheck.as_str(),
+                    Some(resp.code),
+                ))
+            }),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::TpsTokenCheck.as_str(),
+                resp.code,
+            ))),
         }
     }
 
@@ -305,7 +390,6 @@ impl Client {
         url: &String,
         token: &String,
     ) -> Result<String> {
-        log::info!("old token is: {token}");
         log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
         match TerminalQrCode::from_bytes(url.as_bytes()) {
             Ok(qr) => qr.print(),
@@ -316,8 +400,7 @@ impl Client {
         match method {
             PLATFORM_LARK | PLATFORM_OIDC => {
                 log::info!("press enter if you finish auth");
-                let stdin = io::stdin();
-                stdin.lines().next();
+                wait_for_interaction("scan the QR code").await?;
                 self.check_tps_token(token).await
             }
             _ => {
@@ -382,13 +465,16 @@ impl Client {
         let m = Map::new();
         let resp = self.request::<RespOtp>(ApiName::Otp, Some(m)).await?;
         match resp.code {
-            0 => Ok(resp.data.context("otp response missing data")?.url),
-            _ => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "request otp code failed".to_string());
-                bail!(msg)
-            }
+            0 => resp.data.map(|data| data.url).ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::Otp.as_str(),
+                    Some(resp.code),
+                ))
+            }),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::Otp.as_str(),
+                resp.code,
+            ))),
         }
     }
 
@@ -459,9 +545,17 @@ impl Client {
             .await?;
         match resp.code {
             0 => {
-                let data = resp.data.context("v1 login response missing data")?;
+                let data = resp.data.ok_or_else(|| {
+                    anyhow::Error::new(ClientFailure::protocol(
+                        ApiName::LoginPasswordV1.as_str(),
+                        Some(resp.code),
+                    ))
+                })?;
                 if data.result != "success" {
-                    bail!("v1 login returned unexpected result: {}", data.result);
+                    return Err(anyhow::Error::new(ClientFailure::api(
+                        ApiName::LoginPasswordV1.as_str(),
+                        resp.code,
+                    )));
                 }
                 log::info!("login success");
                 self.change_state(State::Login).await?;
@@ -474,9 +568,9 @@ impl Client {
                         let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
                         for (k, v) in url.query_pairs() {
                             if k == "secret" {
-                                log::info!("got 2fa token: {}", &v);
+                                log::info!("received TOTP enrollment");
                                 self.conf.code = Some(v.to_string());
-                                self.conf.save().await?;
+                                self.conf.save_session().await?;
                                 break;
                             }
                         }
@@ -490,12 +584,10 @@ impl Client {
                 }
                 Ok(())
             }
-            _ => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "v1 login failed".to_string());
-                bail!(msg)
-            }
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::LoginPasswordV1.as_str(),
+                resp.code,
+            ))),
         }
     }
 
@@ -527,9 +619,9 @@ impl Client {
             let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
             for (k, v) in url.query_pairs() {
                 if k == "secret" {
-                    log::info!("got 2fa token: {}", &v);
+                    log::info!("received TOTP enrollment");
                     self.conf.code = Some(v.to_string());
-                    self.conf.save().await?;
+                    self.conf.save_session().await?;
                     break;
                 }
             }
@@ -549,7 +641,18 @@ impl Client {
         let resp = self
             .request::<RespLoginMethod>(ApiName::LoginMethod, None)
             .await?;
-        resp.data.context("login method response missing data")
+        match resp.code {
+            0 => resp.data.ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::LoginMethod.as_str(),
+                    Some(resp.code),
+                ))
+            }),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::LoginMethod.as_str(),
+                resp.code,
+            ))),
+        }
     }
 
     // get 3rd party login methods and links, only lark(feishu) is tested
@@ -557,7 +660,13 @@ impl Client {
         let resp = self
             .request::<Vec<RespTpsLoginMethod>>(ApiName::TpsLoginMethod, None)
             .await?;
-        Ok(resp.data.unwrap_or_default())
+        match resp.code {
+            0 => Ok(resp.data.unwrap_or_default()),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::TpsLoginMethod.as_str(),
+                resp.code,
+            ))),
+        }
     }
 
     // get corplink login method, knowing result can be password or email
@@ -569,8 +678,18 @@ impl Client {
         let resp = self
             .request::<RespCorplinkLoginMethod>(ApiName::CorplinkLoginMethod, Some(m))
             .await?;
-        resp.data
-            .context("corplink login method response missing data")
+        match resp.code {
+            0 => resp.data.ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::CorplinkLoginMethod.as_str(),
+                    Some(resp.code),
+                ))
+            }),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::CorplinkLoginMethod.as_str(),
+                resp.code,
+            ))),
+        }
     }
 
     async fn login_with_password(&mut self, platform: &str) -> Result<String> {
@@ -603,16 +722,16 @@ impl Client {
             .request::<RespLogin>(ApiName::LoginPassword, Some(m))
             .await?;
         match resp.code {
-            0 => Ok(resp
-                .data
-                .context("password login response missing data")?
-                .url),
-            _ => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "login with password failed".to_string());
-                bail!(msg)
-            }
+            0 => resp.data.map(|data| data.url).ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::LoginPassword.as_str(),
+                    Some(resp.code),
+                ))
+            }),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::LoginPassword.as_str(),
+                resp.code,
+            ))),
         }
     }
 
@@ -622,9 +741,16 @@ impl Client {
         m.insert("code_type".to_string(), json!("email"));
         m.insert("user_name".to_string(), json!(&self.conf.username));
 
-        self.request::<Map<String, Value>>(ApiName::RequestEmailCode, Some(m))
+        let resp = self
+            .request::<Map<String, Value>>(ApiName::RequestEmailCode, Some(m))
             .await?;
-        Ok(())
+        match resp.code {
+            0 => Ok(()),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::RequestEmailCode.as_str(),
+                resp.code,
+            ))),
+        }
     }
 
     async fn login_with_email(&mut self) -> Result<String> {
@@ -633,31 +759,34 @@ impl Client {
         self.request_email_code().await?;
 
         log::info!("input your code from email:");
-        let input = utils::read_line().await?;
-        let code = input.trim();
+        let code = read_interactive_line("email verification code").await?;
         let mut m = Map::new();
         m.insert("forget_password".to_string(), json!(false));
         m.insert("code_type".to_string(), json!("email"));
-        m.insert("code".to_string(), json!(code));
+        m.insert("code".to_string(), json!(&code));
 
         let resp = self
             .request::<RespLogin>(ApiName::LoginEmail, Some(m))
             .await?;
         match resp.code {
-            0 => Ok(resp.data.context("email login response missing data")?.url),
-            _ => bail!(format!(
-                "failed to login with email code {}: {}",
-                code,
-                resp.message.unwrap_or_else(|| "unknown error".to_string())
-            )),
+            0 => resp.data.map(|data| data.url).ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::LoginEmail.as_str(),
+                    Some(resp.code),
+                ))
+            }),
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::LoginEmail.as_str(),
+                resp.code,
+            ))),
         }
     }
 
-    async fn handle_logout_err(&mut self, msg: String) -> Result<()> {
+    async fn handle_logout_err(&mut self, operation: &'static str, code: i32) -> Result<()> {
         self.change_state(State::Init)
             .await
-            .context("failed to reset state after logout")?;
-        bail!("operation failed because of logout: {msg}")
+            .context("failed to reset state after authentication expiry")?;
+        Err(anyhow::Error::new(ClientFailure::api(operation, code)))
     }
 
     async fn list_vpn(&mut self) -> Result<Vec<RespVpnInfo>> {
@@ -665,19 +794,21 @@ impl Client {
             .request::<Vec<RespVpnInfo>>(ApiName::ListVPN, None)
             .await?;
         match resp.code {
-            0 => resp.data.context("list vpn response missing data"),
+            0 => resp.data.ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::ListVPN.as_str(),
+                    Some(resp.code),
+                ))
+            }),
             101 => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "logout required".to_string());
-                self.handle_logout_err(msg).await?;
+                self.handle_logout_err(ApiName::ListVPN.as_str(), resp.code)
+                    .await?;
                 unreachable!()
             }
-            _ => bail!(format!(
-                "failed to list vpn with error {}: {}",
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::ListVPN.as_str(),
                 resp.code,
-                resp.message.unwrap_or_default()
-            )),
+            ))),
         }
     }
 
@@ -772,11 +903,10 @@ impl Client {
         let latency = req_end - req_start;
         match resp.code {
             0 => Ok(latency),
-            _ => bail!(format!(
-                "failed to ping vpn with error {}: {}",
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::PingVPN.as_str(),
                 resp.code,
-                resp.message.unwrap_or_default()
-            )),
+            ))),
         }
     }
 
@@ -800,7 +930,7 @@ impl Client {
                 log::info!("use empty 2fa code (tps login already verified)");
             } else {
                 log::info!("input your 2fa code:");
-                otp = utils::read_line().await?;
+                otp = read_interactive_line("two-factor authentication code").await?;
             }
         }
         let mut m = Map::new();
@@ -810,19 +940,21 @@ impl Client {
             .request::<RespWgInfo>(ApiName::ConnectVPN, Some(m))
             .await?;
         match resp.code {
-            0 => resp.data.context("connect vpn response missing data"),
+            0 => resp.data.ok_or_else(|| {
+                anyhow::Error::new(ClientFailure::protocol(
+                    ApiName::ConnectVPN.as_str(),
+                    Some(resp.code),
+                ))
+            }),
             101 => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "logout required".to_string());
-                self.handle_logout_err(msg).await?;
+                self.handle_logout_err(ApiName::ConnectVPN.as_str(), resp.code)
+                    .await?;
                 unreachable!()
             }
-            _ => bail!(format!(
-                "failed to fetch peer info with error {}: {}",
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::ConnectVPN.as_str(),
                 resp.code,
-                resp.message.unwrap_or_default()
-            )),
+            ))),
         }
     }
 
@@ -884,6 +1016,7 @@ impl Client {
         };
         let vpn_addr = format!("{}:{}", vpn.ip, vpn.vpn_port);
         log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        self.set_vpn_target(vpn)?;
 
         let key = self
             .conf
@@ -946,8 +1079,10 @@ impl Client {
             }
         };
         append_extra_allowed_ips(&mut allowed_ips, self.conf.extra_allowed_ips.as_ref())?;
-        let managed_allowed_ips = crate::managed_routes::resolve_managed_routes(&self.conf).await?;
-        append_routes(&mut allowed_ips, "managed_routes", &managed_allowed_ips)?;
+        let managed_report =
+            crate::managed_routes::resolve_managed_routes_report(&self.conf, true).await?;
+        append_routes(&mut allowed_ips, "managed_routes", &managed_report.routes)?;
+        self.managed_routes_report = Some(managed_report);
 
         // Carve user-specified CIDRs out of allowed_ips. This removes any IPs in
         // vpn_disallowed_routes from the VPN's AllowedIPs (and the system routes
@@ -1053,6 +1188,41 @@ impl Client {
         Ok(wg_conf)
     }
 
+    fn set_vpn_target(&mut self, vpn: &RespVpnInfo) -> Result<()> {
+        let server_url = self
+            .conf
+            .server
+            .as_ref()
+            .context("server url is required to connect vpn")?;
+        let mut url = Url::from_str(server_url)
+            .with_context(|| format!("invalid server url: {server_url}"))?;
+        url.set_host(Some(vpn.ip.as_str()))
+            .context("failed to set vpn host")?;
+        url.set_port(Some(vpn.api_port))
+            .or_else(|_| bail!("failed to set vpn port"))?;
+        self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
+        Ok(())
+    }
+
+    pub fn managed_routes_report(&self) -> Option<&RouteResolutionReport> {
+        self.managed_routes_report.as_ref()
+    }
+
+    pub async fn mark_managed_routes_applied(
+        &self,
+        wg_conf: &WgConf,
+        generation: &str,
+        pid: u32,
+    ) -> Result<()> {
+        let Some(report) = self.managed_routes_report.as_ref() else {
+            return Ok(());
+        };
+        crate::managed_routes::mark_managed_routes_applied(
+            &self.conf, report, wg_conf, generation, pid,
+        )
+        .await
+    }
+
     pub async fn keep_alive_vpn(&mut self, conf: &WgConf, interval: u64) {
         loop {
             log::info!("keep alive");
@@ -1085,11 +1255,10 @@ impl Client {
             .await?;
         match resp.code {
             0 => Ok(()),
-            _ => bail!(format!(
-                "failed to report connection with error {}: {}",
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::KeepAliveVPN.as_str(),
                 resp.code,
-                resp.message.unwrap_or_default()
-            )),
+            ))),
         }
     }
 
@@ -1110,11 +1279,10 @@ impl Client {
             .await?;
         match resp.code {
             0 => Ok(()),
-            _ => bail!(format!(
-                "failed to fetch peer info with error {}: {}",
+            _ => Err(anyhow::Error::new(ClientFailure::api(
+                ApiName::DisconnectVPN.as_str(),
                 resp.code,
-                resp.message.unwrap_or_default()
-            )),
+            ))),
         }
     }
 
@@ -1147,11 +1315,25 @@ impl Client {
                 }
             }
         }
-        // the endpoint replies with a 302 redirect (not JSON), so just confirm
-        // the request went through instead of parsing a response body.
-        let resp = req.send().await.context("logout request failed")?;
-        log::info!("logout (current terminal) status: {}", resp.status());
-        Ok(())
+        // The endpoint may reply with a redirect (not JSON). Check the HTTP
+        // result, but always clear the local session so a failed remote logout
+        // cannot leave the next run believing it is authenticated.
+        let response = req
+            .send()
+            .await
+            .map_err(|_| anyhow::Error::new(ClientFailure::transport(ApiName::Logout.as_str())));
+        let state_result = self.change_state(State::Init).await;
+        state_result.context("failed to persist local logout state")?;
+        let resp = response?;
+        if resp.status().is_success() || resp.status().is_redirection() {
+            log::info!("logout (current terminal) completed");
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(ClientFailure::http(
+                ApiName::Logout.as_str(),
+                resp.status().as_u16(),
+            )))
+        }
     }
 }
 
@@ -1162,15 +1344,34 @@ fn cookie_file_path(conf_file: &str, interface_name: &str, suffix: &str) -> path
     dir.join(format!("{interface_name}_{suffix}"))
 }
 
-fn load_cookie_store(cookie_file: &path::Path) -> Result<CookieStore> {
+fn cookie_file_path_for_identity(
+    conf_file: &str,
+    interface_name: &str,
+    identity: &str,
+    suffix: &str,
+) -> path::PathBuf {
+    let dir = path::Path::new(conf_file)
+        .parent()
+        .unwrap_or_else(|| path::Path::new("."));
+    dir.join(format!("{interface_name}_{identity}_{suffix}"))
+}
+
+fn load_cookie_store(cookie_file: &path::Path) -> Result<LoadedCookieStore> {
     match fs::File::open(cookie_file).map(io::BufReader::new) {
-        Ok(file) => CookieStore::load_json_all(file).or_else(|e| {
-            bail!(
-                "failed to load cookie store from {}: {e}",
-                cookie_file.display()
-            )
+        Ok(file) => match CookieStore::load_json_all(file) {
+            Ok(store) => Ok(LoadedCookieStore {
+                store,
+                corrupted: false,
+            }),
+            Err(_) => Ok(LoadedCookieStore {
+                store: CookieStore::default(),
+                corrupted: true,
+            }),
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(LoadedCookieStore {
+            store: CookieStore::default(),
+            corrupted: false,
         }),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(CookieStore::default()),
         Err(err) => Err(err)
             .with_context(|| format!("failed to open cookie file {}", cookie_file.display())),
     }
@@ -1276,5 +1477,644 @@ mod tests {
             path,
             path::PathBuf::from("/tmp/corplink/utun12345_cookies.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn corrupted_cookie_store_requires_login_without_overwriting_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("corplink-cookie-corrupt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        fs::write(
+            &config_path,
+            br#"{"company_name":"company","username":"user","server":"http://127.0.0.1"}"#,
+        )
+        .unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+        let cookie_path = cookie_file_path_for_identity(
+            config_path.to_str().unwrap(),
+            config.interface_name.as_deref().unwrap(),
+            &config.session_identity_tag(),
+            COOKIE_FILE_SUFFIX,
+        );
+        let corrupt = b"not-json-cookie-store";
+        fs::write(&cookie_path, corrupt).unwrap();
+
+        let client = Client::new(config).unwrap();
+
+        assert!(client.need_login());
+        assert_eq!(fs::read(cookie_path).unwrap(), corrupt);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_failure_preserves_the_authenticated_session() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = b"secret response body must not escape";
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-http-failure-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+
+        let mut client = Client::new(config).unwrap();
+        assert!(!client.need_login());
+        let error = match client.connect_vpn().await {
+            Ok(_) => panic!("429 must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            crate::api::classify_error(&error),
+            crate::api::FailureKind::RateLimited
+        );
+        assert!(!client.need_login());
+        assert!(error.to_string().contains("429"));
+        assert!(!error.to_string().contains("secret response body"));
+        server_thread.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn latency_selection_negotiates_with_the_selected_gateway() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        fn serve(
+            listener: TcpListener,
+            responses: Vec<(u64, String)>,
+            seen: Arc<Mutex<Vec<String>>>,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                for (delay_ms, body) in responses {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    let (mut stream, _) = loop {
+                        match listener.accept() {
+                            Ok(connection) => break connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "timed out waiting for expected gateway request"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("gateway accept failed: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut request = [0_u8; 8192];
+                    let count = stream.read(&mut request).unwrap();
+                    let request = String::from_utf8_lossy(&request[..count]);
+                    let request_line = request.lines().next().unwrap_or_default().to_string();
+                    seen.lock().unwrap().push(request_line);
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            })
+        }
+
+        let list_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        list_listener.set_nonblocking(true).unwrap();
+        a_listener.set_nonblocking(true).unwrap();
+        b_listener.set_nonblocking(true).unwrap();
+        let list_port = list_listener.local_addr().unwrap().port();
+        let a_port = a_listener.local_addr().unwrap().port();
+        let b_port = b_listener.local_addr().unwrap().port();
+        let a_seen = Arc::new(Mutex::new(Vec::new()));
+        let b_seen = Arc::new(Mutex::new(Vec::new()));
+        let list_seen = Arc::new(Mutex::new(Vec::new()));
+        let list_body = format!(
+            "{{\"code\":0,\"data\":[{{\"api_port\":{a_port},\"vpn_port\":51820,\"ip\":\"127.0.0.1\",\"protocol_mode\":2,\"name\":\"a\",\"en_name\":\"A\",\"icon\":\"\",\"id\":1,\"timeout\":10}},{{\"api_port\":{b_port},\"vpn_port\":51821,\"ip\":\"127.0.0.1\",\"protocol_mode\":2,\"name\":\"b\",\"en_name\":\"B\",\"icon\":\"\",\"id\":2,\"timeout\":10}}]}}"
+        );
+        let conn_body = r#"{"code":0,"data":{"ip":"10.0.0.2","ipv6":"","ip_mask":"24","public_key":"peer-key","setting":{"vpn_mtu":1420,"vpn_dns":"10.0.0.53","vpn_dns_backup":"","vpn_dns_domain_split":null,"vpn_route_full":[],"vpn_route_split":["10.0.0.0/8"],"v6_route_full":null,"v6_route_split":null},"mode":0}}"#;
+        let list_thread = serve(list_listener, vec![(0, list_body)], Arc::clone(&list_seen));
+        let a_thread = serve(
+            a_listener,
+            vec![
+                (0, r#"{"code":0,"data":"ok"}"#.to_string()),
+                (0, conn_body.to_string()),
+            ],
+            Arc::clone(&a_seen),
+        );
+        let b_thread = serve(
+            b_listener,
+            vec![(80, r#"{"code":0,"data":"ok"}"#.to_string())],
+            Arc::clone(&b_seen),
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-latency-selection-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let server = format!("http://127.0.0.1:{list_port}");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"platform\":\"lark\",\"server\":\"{server}\",\"vpn_select_strategy\":\"latency\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+
+        let mut client = Client::new(config).unwrap();
+        let wg = client.connect_vpn().await.unwrap();
+
+        assert_eq!(wg.peer_address, "127.0.0.1:51820");
+        assert_eq!(a_seen.lock().unwrap().len(), 2);
+        assert_eq!(b_seen.lock().unwrap().len(), 1);
+        assert!(a_seen.lock().unwrap()[0].contains("/vpn/ping?"));
+        assert!(a_seen.lock().unwrap()[1].contains("/vpn/conn?"));
+        assert!(b_seen.lock().unwrap()[0].contains("/vpn/ping?"));
+        assert_eq!(list_seen.lock().unwrap().len(), 1);
+
+        list_thread.join().unwrap();
+        a_thread.join().unwrap();
+        b_thread.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_http_failure_resets_session_state() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = b"authentication response must not be logged";
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-auth-failure-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+
+        let mut client = Client::new(config).unwrap();
+        assert!(!client.need_login());
+        let error = match client.connect_vpn().await {
+            Ok(_) => panic!("401 must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            crate::api::classify_error(&error),
+            crate::api::FailureKind::AuthenticationExpired
+        );
+        assert!(client.need_login());
+        assert!(error.to_string().contains("401"));
+        assert!(!error
+            .to_string()
+            .contains("authentication response must not be logged"));
+        server_thread.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_account_never_reuses_old_cookie_after_auth_failure_and_restart() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_server = Arc::clone(&requests);
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("gateway accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 8192];
+                let count = stream.read(&mut request).unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..count]).to_string());
+                let body = b"expired";
+                write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-cookie-identity-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let first_source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"account-a\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, first_source).unwrap();
+        let first = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let first_cookie_path = cookie_file_path_for_identity(
+            config_path.to_str().unwrap(),
+            first.interface_name.as_deref().unwrap(),
+            &first.session_identity_tag(),
+            COOKIE_FILE_SUFFIX,
+        );
+        let mut cookie_store = CookieStore::default();
+        let server_url = Url::parse(&server).unwrap();
+        cookie_store
+            .insert_raw(&RawCookie::new("account", "account-a"), &server_url)
+            .unwrap();
+        let mut cookie_bytes = Vec::new();
+        cookie_store
+            .save_incl_expired_and_nonpersistent_json(&mut cookie_bytes)
+            .unwrap();
+        fs::write(&first_cookie_path, cookie_bytes).unwrap();
+
+        let second_source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"account-b\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, second_source).unwrap();
+        let mut second = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        second.state = Some(State::Login);
+        second.save_session().await.unwrap();
+        let mut first_client = Client::new(second).unwrap();
+        let first_error = match first_client.connect_vpn().await {
+            Ok(_) => panic!("expired account must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            crate::api::classify_error(&first_error),
+            crate::api::FailureKind::AuthenticationExpired
+        );
+        assert!(first_client.need_login());
+
+        let mut restarted = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        restarted.state = Some(State::Login);
+        restarted.save_session().await.unwrap();
+        let mut second_client = Client::new(restarted).unwrap();
+        let _second_error = match second_client.connect_vpn().await {
+            Ok(_) => panic!("expired account must fail after restart"),
+            Err(error) => error,
+        };
+        assert!(second_client.need_login());
+
+        server_thread.join().unwrap();
+        for request in requests.lock().unwrap().iter() {
+            assert!(!request.contains("account=account-a"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovering_from_corrupt_cookie_preserves_original_before_set_cookie_write() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = br#"{"code":0,"data":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: recovered=1; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-cookie-recovery-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+        let cookie_path = cookie_file_path_for_identity(
+            config_path.to_str().unwrap(),
+            config.interface_name.as_deref().unwrap(),
+            &config.session_identity_tag(),
+            COOKIE_FILE_SUFFIX,
+        );
+        let corrupt = b"corrupt-cookie-evidence";
+        fs::write(&cookie_path, corrupt).unwrap();
+
+        let mut client = Client::new(config).unwrap();
+        let _ = client.connect_vpn().await;
+        server_thread.join().unwrap();
+
+        assert_ne!(fs::read(&cookie_path).unwrap(), corrupt);
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("cookies.jsonl.corrupt.")
+            })
+            .expect("corrupt cookie backup should remain");
+        assert_eq!(fs::read(backup.path()).unwrap(), corrupt);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_cookie_jsonl_is_migrated_to_identity_specific_store() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let request = Arc::new(Mutex::new(String::new()));
+        let request_for_server = Arc::clone(&request);
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let count = stream.read(&mut bytes).unwrap();
+            *request_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&bytes[..count]).to_string();
+            let body = b"expired";
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-legacy-cookie-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"device_name\":\"legacy-device\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+        let legacy_path = cookie_file_path(
+            config_path.to_str().unwrap(),
+            config.interface_name.as_deref().unwrap(),
+            COOKIE_FILE_SUFFIX,
+        );
+        let mut cookie_store = CookieStore::default();
+        let server_url = Url::parse(&server).unwrap();
+        cookie_store
+            .insert(
+                Cookie::try_from_raw_cookie(
+                    &RawCookie::build("legacy", "1")
+                        .domain("127.0.0.1")
+                        .path("/")
+                        .finish(),
+                    &server_url,
+                )
+                .unwrap(),
+                &server_url,
+            )
+            .unwrap();
+        let mut cookie_bytes = Vec::new();
+        cookie_store
+            .save_incl_expired_and_nonpersistent_json(&mut cookie_bytes)
+            .unwrap();
+        fs::write(&legacy_path, cookie_bytes).unwrap();
+
+        let identity_path = cookie_file_path_for_identity(
+            config_path.to_str().unwrap(),
+            config.interface_name.as_deref().unwrap(),
+            &config.session_identity_tag(),
+            COOKIE_FILE_SUFFIX,
+        );
+        // Simulate a process dying after Config::from_file wrote the session
+        // sidecar but before Client copied the legacy cookie store.
+        let resumed = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let mut client = Client::new(resumed).unwrap();
+        let _ = client.connect_vpn().await;
+        server_thread.join().unwrap();
+
+        assert!(identity_path.exists());
+        let captured_request = request.lock().unwrap().clone();
+        assert!(
+            captured_request.contains("legacy=1"),
+            "captured request was: {captured_request}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_legacy_cookie_recovers_to_identity_store_on_set_cookie() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_server = Arc::clone(&requests);
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 8192];
+                let count = stream.read(&mut request).unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..count]).to_string());
+                let body = br#"{"code":0,"data":[]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: recovered=1; Path=/; Max-Age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "corplink-legacy-cookie-recovery-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"device_name\":\"legacy-device\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let legacy_path = cookie_file_path(
+            config_path.to_str().unwrap(),
+            config.interface_name.as_deref().unwrap(),
+            COOKIE_FILE_SUFFIX,
+        );
+        fs::write(&legacy_path, b"corrupt-legacy-cookie").unwrap();
+        let identity_path = cookie_file_path_for_identity(
+            config_path.to_str().unwrap(),
+            config.interface_name.as_deref().unwrap(),
+            &config.session_identity_tag(),
+            COOKIE_FILE_SUFFIX,
+        );
+
+        let mut first_client = Client::new(config).unwrap();
+        assert!(first_client.need_login());
+        let _ = first_client.connect_vpn().await;
+        assert!(identity_path.exists());
+
+        let restarted = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let mut second_client = Client::new(restarted).unwrap();
+        let _ = second_client.connect_vpn().await;
+        server_thread.join().unwrap();
+
+        assert!(requests.lock().unwrap()[1].contains("recovered=1"));
+        assert_eq!(fs::read(&legacy_path).unwrap(), b"corrupt-legacy-cookie");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_checks_http_result_and_persists_local_init_state() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = format!("http://127.0.0.1:{port}");
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = b"logout failure body";
+            write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("corplink-logout-check-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"platform\":\"lark\",\"server\":\"{server}\"}}"
+        );
+        fs::write(&config_path, source).unwrap();
+        let mut config = Config::from_file(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        config.state = Some(State::Login);
+        config.save_session().await.unwrap();
+        let mut client = Client::new(config).unwrap();
+        assert!(!client.need_login());
+
+        let error = client.logout().await.expect_err("503 logout must fail");
+        assert_eq!(
+            crate::api::classify_error(&error),
+            crate::api::FailureKind::Server
+        );
+        assert!(client.need_login());
+        assert!(!error.to_string().contains("logout failure body"));
+        server_thread.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 }

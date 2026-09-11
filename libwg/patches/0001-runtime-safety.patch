@@ -1,0 +1,249 @@
+diff --git a/corplink/link_cleanup.go b/corplink/link_cleanup.go
+new file mode 100644
+index 0000000..c4552a0
+--- /dev/null
++++ b/corplink/link_cleanup.go
+@@ -0,0 +1,7 @@
++//go:build !darwin
++
++package corplink
++
++// CloseInterfaceResources is a no-op on platforms without the Darwin ioctl
++// descriptor. It keeps the bridge cleanup contract portable.
++func CloseInterfaceResources() {}
+diff --git a/corplink/link_darwin.go b/corplink/link_darwin.go
+index 55ccf27..8659d4c 100644
+--- a/corplink/link_darwin.go
++++ b/corplink/link_darwin.go
+@@ -111,12 +111,23 @@ func SetInterfaceAddress(name, addr string) error {
+ 	}
+ 	err = unix.IoctlSetInt(ioctlFD, unix.SIOCSIFADDR, toInt(&req))
+ 	if err != nil {
+-		println(err.Error())
+-		panic(err)
++		return fmt.Errorf("failed to set IPv4 address: %w", err)
+ 	}
+ 	return nil
+ }
+ 
++// CloseInterfaceResources releases the process-wide Darwin ioctl descriptor
++// and forgets address state so repeated start/stop cycles cannot reuse stale
++// interface data.
++func CloseInterfaceResources() {
++	if ioctlFD != 0 {
++		_ = unix.Close(ioctlFD)
++		ioctlFD = 0
++	}
++	interfaceIP = nil
++	interfaceIPv6 = nil
++}
++
+ func toInt(data any) int {
+ 	v := reflect.ValueOf(data)
+ 	return int(v.Pointer())
+diff --git a/libwg/main.go b/libwg/main.go
+index 96cd008..b53f30b 100644
+--- a/libwg/main.go
++++ b/libwg/main.go
+@@ -17,10 +17,13 @@ import (
+ 	"fmt"
+ 	// "net/http"
+ 	// _ "net/http/pprof"
++	"net"
+ 	"net/netip"
+ 	"strings"
++	"sync"
+ 
+ 	"golang.zx2c4.com/wireguard/conn"
++	"golang.zx2c4.com/wireguard/corplink"
+ 	"golang.zx2c4.com/wireguard/device"
+ 	"golang.zx2c4.com/wireguard/ipc"
+ 	"golang.zx2c4.com/wireguard/tun"
+@@ -37,12 +40,24 @@ var wgDevice *device.Device
+ // tnet is the userspace network stack used in netstack (SOCKS5) mode.
+ // It is nil when running in the normal kernel-TUN mode.
+ var tnet *netstack.Net
++var runtimeMu sync.Mutex
++var socksListener net.Listener
++var socksServeErr error
++var socksGeneration uint64
+ 
+ //export uapi
+ func uapi(cmdStr *C.cchar_t) *C.char {
++	runtimeMu.Lock()
++	defer runtimeMu.Unlock()
++	if wgDevice == nil || logger == nil {
++		return C.CString(unavailableUAPI())
++	}
+ 	content := C.GoString(cmdStr)
+ 	cmds := strings.Split(content, "\n")
+ 	var result string
++	if socksServeErr != nil {
++		return C.CString(fmt.Sprintf("errno=%d\n\n", ipc.IpcErrorUnknown))
++	}
+ 	switch cmds[0] {
+ 	case "set=1":
+ 		logger.Verbosef("set uapi")
+@@ -81,12 +96,31 @@ var logger *device.Logger
+ 
+ //export stopWg
+ func stopWg() {
+-	if wgDevice != nil {
+-		wgDevice.Close()
++	runtimeMu.Lock()
++	device := wgDevice
++	wgDevice = nil
++	listener := socksListener
++	socksListener = nil
++	socksServeErr = nil
++	socksGeneration++
++	tnet = nil
++	runtimeMu.Unlock()
++	if listener != nil {
++		_ = listener.Close()
++	}
++	if device != nil {
++		device.Close()
++	}
++	corplink.CloseInterfaceResources()
++	if logger != nil {
+ 		logger.Verbosef("Shutting down")
+ 	}
+ }
+ 
++func unavailableUAPI() string {
++	return fmt.Sprintf("errno=%d\n\n", ipc.IpcErrorUnknown)
++}
++
+ // startWg param:
+ //
+ //	protocol:
+@@ -96,6 +130,7 @@ func stopWg() {
+ //export startWg
+ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
+ 	name := C.GoString(interfaceName)
++	stopWg()
+ 	logger = device.NewLogger(
+ 		int(logLevel),
+ 		fmt.Sprintf("wg-corplink(%s) ", name),
+@@ -123,6 +158,7 @@ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
+ 		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+ 	default:
+ 		logger.Errorf("Protocol %d not supported", protocol)
++		tunDevice.Close()
+ 		return ExitSetupFailed
+ 	}
+ 
+@@ -132,6 +168,9 @@ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
+ 
+ 	logger.Verbosef("Device %s started", name)
+ 	ret := upDeviceForWindows(wgDevice)
++	if ret != ExitSetupSuccess {
++		stopWg()
++	}
+ 	return C.int(ret)
+ }
+ 
+@@ -178,6 +217,7 @@ func parseAddrList(s string) ([]netip.Addr, error) {
+ //export startWgNetstack
+ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListen, socksUser, socksPass *C.cchar_t, mtu C.int) C.int {
+ 	logger = device.NewLogger(int(logLevel), "wg-corplink(netstack) ")
++	stopWg()
+ 	logger.Verbosef("Starting wg-corplink version %s (netstack/socks5 mode)", Version)
+ 
+ 	addrs, err := parseAddrList(C.GoString(addresses))
+@@ -214,21 +254,39 @@ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListe
+ 		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+ 	default:
+ 		logger.Errorf("Protocol %d not supported", protocol)
++		tunDevice.Close()
++		tnet = nil
+ 		return ExitSetupFailed
+ 	}
+ 
+ 	if err := wgDevice.Up(); err != nil {
+ 		logger.Errorf("Failed to bring up netstack device: %v", err)
++		stopWg()
+ 		return ExitSetupFailed
+ 	}
+ 
+ 	listen := C.GoString(socksListen)
+ 	user := C.GoString(socksUser)
+ 	pass := C.GoString(socksPass)
+-	if err := startSocks5(listen, user, pass, netStack, logger); err != nil {
++	listener, serveErrors, err := startSocks5(listen, user, pass, netStack, logger)
++	if err != nil {
+ 		logger.Errorf("Failed to start socks5 proxy on %s: %v", listen, err)
++		stopWg()
+ 		return ExitSetupFailed
+ 	}
++	runtimeMu.Lock()
++	socksListener = listener
++	socksGeneration++
++	generation := socksGeneration
++	runtimeMu.Unlock()
++	go func() {
++		err := <-serveErrors
++		runtimeMu.Lock()
++		if socksGeneration == generation {
++			socksServeErr = err
++		}
++		runtimeMu.Unlock()
++	}()
+ 	logger.Verbosef("socks5 proxy listening on %s", listen)
+ 	return ExitSetupSuccess
+ }
+diff --git a/libwg/main_test.go b/libwg/main_test.go
+new file mode 100644
+index 0000000..d003c5a
+--- /dev/null
++++ b/libwg/main_test.go
+@@ -0,0 +1,17 @@
++package main
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestUnavailableUAPIIsExplicit(t *testing.T) {
++	if response := unavailableUAPI(); !strings.Contains(response, "errno=") {
++		t.Fatalf("expected an errno response, got %q", response)
++	}
++}
++
++func TestStopWgIsIdempotent(t *testing.T) {
++	stopWg()
++	stopWg()
++}
+diff --git a/libwg/socks5.go b/libwg/socks5.go
+index a88a5e2..69339a7 100644
+--- a/libwg/socks5.go
++++ b/libwg/socks5.go
+@@ -57,10 +57,10 @@ func (l socksLogger) Errorf(format string, args ...interface{}) {
+ // startSocks5 binds a SOCKS5 listener on the host and serves it in the
+ // background. When username is non-empty, username/password authentication is
+ // required (clients offering only no-auth are rejected).
+-func startSocks5(listen, username, password string, tnet *netstack.Net, logger *device.Logger) error {
++func startSocks5(listen, username, password string, tnet *netstack.Net, logger *device.Logger) (net.Listener, <-chan error, error) {
+ 	ln, err := net.Listen("tcp", listen)
+ 	if err != nil {
+-		return err
++		return nil, nil, err
+ 	}
+ 
+ 	opts := []socks5.Option{
+@@ -80,10 +80,12 @@ func startSocks5(listen, username, password string, tnet *netstack.Net, logger *
+ 	}
+ 
+ 	server := socks5.NewServer(opts...)
++	serveErrors := make(chan error, 1)
+ 	go func() {
+ 		if err := server.Serve(ln); err != nil {
+ 			logger.Errorf("socks5: serve stopped: %v", err)
++			serveErrors <- err
+ 		}
+ 	}()
+-	return nil
++	return ln, serveErrors, nil
+ }

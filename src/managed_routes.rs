@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
+use crate::api::{ClientFailure, FailureKind};
 use crate::config::{Config, ManagedRouteSource, ManagedRoutesConfig};
 
 const DEFAULT_CACHE_FILE: &str = ".run/managed-routes-cache.json";
@@ -18,6 +19,131 @@ const DEFAULT_GITHUB_META_URL: &str = "https://api.github.com/meta";
 const DEFAULT_GITHUB_KEYS: &[&str] = &["web", "api", "git"];
 const DEFAULT_DOH_URL: &str = "https://cloudflare-dns.com/dns-query";
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteFailureKind {
+    RecoverableTransport,
+    RateLimited,
+    Server,
+    Configuration,
+    Protocol,
+}
+
+impl RouteFailureKind {
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::RecoverableTransport | Self::RateLimited | Self::Server
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ManagedRouteFailure {
+    kind: RouteFailureKind,
+    source: String,
+}
+
+impl ManagedRouteFailure {
+    pub fn kind(&self) -> RouteFailureKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for ManagedRouteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "managed route {} failed for source {}",
+            self.kind, self.source
+        )
+    }
+}
+
+impl std::error::Error for ManagedRouteFailure {}
+
+impl std::fmt::Display for RouteFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RecoverableTransport => "transport",
+            Self::RateLimited => "rate_limited",
+            Self::Server => "server",
+            Self::Configuration => "configuration",
+            Self::Protocol => "protocol",
+        })
+    }
+}
+
+pub fn classify_route_error(error: &anyhow::Error) -> RouteFailureKind {
+    if let Some(failure) = error.downcast_ref::<ManagedRouteFailure>() {
+        return failure.kind();
+    }
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = error.status() {
+                return match status.as_u16() {
+                    429 => RouteFailureKind::RateLimited,
+                    500..=599 => RouteFailureKind::Server,
+                    _ => RouteFailureKind::Protocol,
+                };
+            }
+            if error.is_connect() || error.is_timeout() || error.is_request() {
+                return RouteFailureKind::RecoverableTransport;
+            }
+        }
+    }
+    RouteFailureKind::Protocol
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteSourceStatus {
+    Fresh,
+    Cache,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RouteSourceReport {
+    pub name: String,
+    pub source_type: String,
+    pub status: RouteSourceStatus,
+    pub routes: Vec<String>,
+    pub resolved_at: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RouteResolutionReport {
+    pub routes: Vec<String>,
+    pub sources: Vec<RouteSourceReport>,
+    pub resolved_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedRoutesApplied {
+    pub config_identity: String,
+    pub generation: String,
+    pub pid: u32,
+    pub applied_at: i64,
+    pub mode: AppliedRouteMode,
+    pub resolution_routes: Vec<String>,
+    pub sources: Vec<RouteSourceReport>,
+    pub allowed_ips: Vec<String>,
+    pub routes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AppliedRouteMode {
+    Kernel,
+    Netstack,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RouteStatusResponse {
+    pub last_applied: Option<ManagedRoutesApplied>,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct ManagedRouteCache {
@@ -36,11 +162,24 @@ struct SourceCacheEntry {
 }
 
 pub async fn resolve_managed_routes(conf: &Config) -> Result<Vec<String>> {
+    Ok(resolve_managed_routes_report(conf, true).await?.routes)
+}
+
+pub async fn resolve_managed_routes_report(
+    conf: &Config,
+    write_cache: bool,
+) -> Result<RouteResolutionReport> {
     let Some(managed_routes) = conf.managed_routes.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(RouteResolutionReport {
+            resolved_at: unix_now_secs(),
+            ..RouteResolutionReport::default()
+        });
     };
     if !managed_routes.enabled.unwrap_or(true) {
-        return Ok(Vec::new());
+        return Ok(RouteResolutionReport {
+            resolved_at: unix_now_secs(),
+            ..RouteResolutionReport::default()
+        });
     }
 
     let sources = managed_routes
@@ -65,14 +204,18 @@ pub async fn resolve_managed_routes(conf: &Config) -> Result<Vec<String>> {
     let mut cache = ManagedRouteCache::load(&cache_path).await;
     let now = unix_now_secs();
     let mut routes = Vec::new();
+    let mut source_reports = Vec::with_capacity(sources.len());
 
     for source in sources {
         validate_source_name(source.name())?;
         let source_type = source.source_type();
         let source_fingerprint = source_fingerprint(source, include_ipv6)?;
-        match resolve_source(source, include_ipv6).await {
+        let source_result = match resolve_source(source, include_ipv6).await {
+            Ok(source_routes) => normalize_source_routes(source.name(), &source_routes),
+            Err(error) => Err(error),
+        };
+        match source_result {
             Ok(source_routes) => {
-                let source_routes = normalize_source_routes(source.name(), &source_routes)?;
                 log::info!(
                     "managed_routes source {} ({}) resolved {} routes",
                     source.name(),
@@ -88,6 +231,21 @@ pub async fn resolve_managed_routes(conf: &Config) -> Result<Vec<String>> {
                     error: None,
                 });
                 routes.extend(source_routes);
+                source_reports.push(RouteSourceReport {
+                    name: source.name().to_string(),
+                    source_type: source_type.to_string(),
+                    status: RouteSourceStatus::Fresh,
+                    routes: cache
+                        .sources
+                        .iter()
+                        .find(|entry| {
+                            entry.name == source.name() && entry.source_type == source_type
+                        })
+                        .map(|entry| entry.routes.clone())
+                        .unwrap_or_default(),
+                    resolved_at: now,
+                    error: None,
+                });
             }
             Err(err) => match cache.fresh_entry(source, &source_fingerprint, now, stale_ttl_secs) {
                 Some(entry) => {
@@ -101,30 +259,181 @@ pub async fn resolve_managed_routes(conf: &Config) -> Result<Vec<String>> {
                         age
                     );
                     routes.extend(entry.routes.clone());
+                    source_reports.push(RouteSourceReport {
+                        name: source.name().to_string(),
+                        source_type: source_type.to_string(),
+                        status: RouteSourceStatus::Cache,
+                        routes: entry.routes.clone(),
+                        resolved_at: entry.resolved_at,
+                        error: Some(safe_route_error(&err)),
+                    });
                 }
                 None => {
-                    bail!(
-                        "managed_routes source {} ({}) failed and no fresh cache is available: {:#}",
-                        source.name(),
-                        source_type,
-                        err
-                    );
+                    source_reports.push(RouteSourceReport {
+                        name: source.name().to_string(),
+                        source_type: source_type.to_string(),
+                        status: RouteSourceStatus::Error,
+                        routes: Vec::new(),
+                        resolved_at: now,
+                        error: Some(safe_route_error(&err)),
+                    });
+                    let operation = format!("managed_routes:{}", source.name());
+                    let failure = match classify_route_error(&err) {
+                        RouteFailureKind::RecoverableTransport => {
+                            ClientFailure::transport(operation)
+                        }
+                        RouteFailureKind::RateLimited => {
+                            ClientFailure::new(FailureKind::RateLimited, operation, None, None)
+                        }
+                        RouteFailureKind::Server => {
+                            ClientFailure::new(FailureKind::Server, operation, None, None)
+                        }
+                        RouteFailureKind::Configuration => ClientFailure::configuration(operation),
+                        RouteFailureKind::Protocol => ClientFailure::protocol(operation, None),
+                    };
+                    return Err(anyhow::Error::new(failure));
                 }
             },
         }
     }
 
-    if let Err(err) = cache.save(&cache_path).await {
-        log::warn!(
-            "failed to save managed_routes cache {}: {:#}",
-            cache_path.display(),
-            err
-        );
+    if write_cache {
+        if let Err(err) = cache.save(&cache_path).await {
+            log::warn!(
+                "failed to save managed_routes cache {}: {:#}",
+                cache_path.display(),
+                err
+            );
+        }
     }
 
     dedupe_routes(&mut routes);
     log::info!("managed_routes resolved {} total routes", routes.len());
-    Ok(routes)
+    Ok(RouteResolutionReport {
+        routes,
+        sources: source_reports,
+        resolved_at: now,
+    })
+}
+
+fn safe_route_error(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .next()
+        .map(|cause| cause.to_string())
+        .unwrap_or_else(|| "managed route source failed".to_string())
+}
+
+pub async fn mark_managed_routes_applied(
+    conf: &Config,
+    report: &RouteResolutionReport,
+    wg_conf: &crate::config::WgConf,
+    generation: &str,
+    pid: u32,
+) -> Result<()> {
+    let applied = ManagedRoutesApplied {
+        config_identity: conf.session_identity_tag(),
+        generation: generation.to_string(),
+        pid,
+        applied_at: unix_now_secs(),
+        mode: if conf.socks5_listen.is_some() {
+            AppliedRouteMode::Netstack
+        } else {
+            AppliedRouteMode::Kernel
+        },
+        resolution_routes: report.routes.clone(),
+        sources: report.sources.clone(),
+        allowed_ips: wg_conf.allowed_ips.clone(),
+        routes: if conf.socks5_listen.is_some() {
+            Vec::new()
+        } else {
+            wg_conf.routes.clone()
+        },
+    };
+    let path = resolve_status_path(conf);
+    write_json_atomically(&path, &applied).await
+}
+
+pub async fn read_managed_routes_status(conf: &Config) -> Result<Option<ManagedRoutesApplied>> {
+    let path = resolve_status_path(conf);
+    match fs::read_to_string(&path).await {
+        Ok(data) => {
+            let status: ManagedRoutesApplied = serde_json::from_str(&data).with_context(|| {
+                format!("failed to parse managed routes status {}", path.display())
+            })?;
+            if status.config_identity != conf.session_identity_tag() {
+                return Ok(None);
+            }
+            Ok(Some(status))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read managed routes status {}", path.display())),
+    }
+}
+
+pub async fn routes_command(config_file: &str, write_cache: bool) -> Result<String> {
+    let config = Config::read_only(config_file).await?;
+    let report = resolve_managed_routes_report(&config, write_cache).await?;
+    Ok(serde_json::to_string_pretty(&report)? + "\n")
+}
+
+pub async fn routes_status_command(config_file: &str) -> Result<String> {
+    let config = Config::read_only(config_file).await?;
+    let response = RouteStatusResponse {
+        last_applied: read_managed_routes_status(&config).await?,
+    };
+    Ok(serde_json::to_string_pretty(&response)? + "\n")
+}
+
+fn resolve_status_path(conf: &Config) -> PathBuf {
+    let cache_path = conf
+        .managed_routes
+        .as_ref()
+        .map(|managed| resolve_cache_path(conf, managed))
+        .unwrap_or_else(|| {
+            let base = conf
+                .conf_file
+                .as_deref()
+                .and_then(|file| Path::new(file).parent())
+                .unwrap_or_else(|| Path::new("."));
+            base.join(DEFAULT_CACHE_FILE)
+        });
+    let stem = cache_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("managed-routes");
+    cache_path.with_file_name(format!("{stem}.status.json"))
+}
+
+async fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).await.with_context(|| {
+        format!(
+            "failed to create managed routes state dir {}",
+            parent.display()
+        )
+    })?;
+    let data = serde_json::to_string_pretty(value)? + "\n";
+    let file_name = path
+        .file_name()
+        .context("managed routes state path missing filename")?
+        .to_string_lossy();
+    let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = async {
+        fs::write(&temp, data)
+            .await
+            .with_context(|| format!("failed to write managed routes state {}", temp.display()))?;
+        fs::rename(&temp, path).await.with_context(|| {
+            format!("failed to publish managed routes state {}", path.display())
+        })?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temp).await;
+    }
+    result
 }
 
 async fn resolve_source(source: &ManagedRouteSource, include_ipv6: bool) -> Result<Vec<String>> {
@@ -446,15 +755,26 @@ impl ManagedRouteCache {
             .file_name()
             .context("managed_routes cache path missing filename")?
             .to_string_lossy();
-        let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+        let tmp_path = path.with_file_name(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            unix_now_secs()
+        ));
         let data = serde_json::to_string_pretty(self).context("failed to serialize cache")? + "\n";
-        fs::write(&tmp_path, data)
-            .await
-            .with_context(|| format!("failed to write cache temp file {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, path)
-            .await
-            .with_context(|| format!("failed to replace cache file {}", path.display()))?;
-        Ok(())
+        let result = async {
+            fs::write(&tmp_path, data).await.with_context(|| {
+                format!("failed to write cache temp file {}", tmp_path.display())
+            })?;
+            fs::rename(&tmp_path, path)
+                .await
+                .with_context(|| format!("failed to replace cache file {}", path.display()))?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+        }
+        result
     }
 
     fn upsert(&mut self, entry: SourceCacheEntry) {
@@ -496,6 +816,424 @@ fn unix_now_secs() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn accept_with_timeout(
+        listener: &std::net::TcpListener,
+    ) -> (std::net::TcpStream, std::net::SocketAddr) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok(connection) => {
+                    connection.0.set_nonblocking(false).unwrap();
+                    return connection;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for local HTTP fixture request"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("local HTTP fixture accept failed: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_routes_return_report_without_writing_cache() {
+        let dir = unique_test_dir("corplink-managed-report");
+        let config_path = dir.join("config.json");
+        fs::write(
+            &config_path,
+            br#"{"company_name":"company","username":"user","managed_routes":{"enabled":false,"cache_file":"cache.json"}}"#,
+        )
+        .await
+        .unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let report = resolve_managed_routes_report(&config, false).await.unwrap();
+
+        assert!(report.routes.is_empty());
+        assert!(report.sources.is_empty());
+        assert!(!dir.join("cache.json").exists());
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_report_uses_local_gateway_without_writing_cache() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = br#"{"web":["192.0.2.0/24"]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let dir = unique_test_dir("corplink-managed-preflight");
+        let config_path = dir.join("config.json");
+        let cache_path = dir.join("cache.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"managed_routes\":{{\"enabled\":true,\"cache_file\":\"{}\",\"sources\":[{{\"type\":\"github_meta\",\"name\":\"local\",\"keys\":[\"web\"],\"meta_url\":\"http://127.0.0.1:{port}/meta\"}}]}}}}",
+            cache_path.display()
+        );
+        fs::write(&config_path, source).await.unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let report = resolve_managed_routes_report(&config, false).await.unwrap();
+
+        assert_eq!(report.routes, vec!["192.0.2.0/24"]);
+        assert_eq!(report.sources[0].status, RouteSourceStatus::Fresh);
+        assert!(!cache_path.exists());
+        server.join().unwrap();
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn applied_status_is_separate_from_resolution_and_readable_without_network() {
+        let dir = unique_test_dir("corplink-managed-status");
+        let config_path = dir.join("config.json");
+        fs::write(
+            &config_path,
+            br#"{"company_name":"company","username":"user","managed_routes":{"enabled":false}}"#,
+        )
+        .await
+        .unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let report = resolve_managed_routes_report(&config, false).await.unwrap();
+        let wg_conf = crate::config::WgConf {
+            address: "10.0.0.2/24".to_string(),
+            address6: String::new(),
+            peer_address: "192.0.2.1:51820".to_string(),
+            mtu: 1420,
+            public_key: "public".to_string(),
+            private_key: "private".to_string(),
+            peer_key: "peer".to_string(),
+            allowed_ips: vec!["10.0.0.0/8".to_string()],
+            routes: vec!["10.0.0.0/8".to_string()],
+            dns: "10.0.0.53".to_string(),
+            protocol: 0,
+        };
+
+        mark_managed_routes_applied(&config, &report, &wg_conf, "generation-test", 1234)
+            .await
+            .unwrap();
+        let status = read_managed_routes_status(&config).await.unwrap().unwrap();
+
+        assert_eq!(status.generation, "generation-test");
+        assert_eq!(status.pid, 1234);
+        assert_eq!(status.mode, AppliedRouteMode::Kernel);
+        assert_eq!(status.config_identity, config.session_identity_tag());
+        assert_eq!(status.allowed_ips, wg_conf.allowed_ips);
+        assert_eq!(status.routes, wg_conf.routes);
+        assert!(status.resolution_routes.is_empty());
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn applied_status_isolated_between_config_identities() {
+        let dir = unique_test_dir("corplink-managed-status-isolation");
+        let config_a_path = dir.join("a.json");
+        let config_b_path = dir.join("b.json");
+        fs::write(
+            &config_a_path,
+            br#"{"company_name":"company","username":"a","managed_routes":{"enabled":false,"cache_file":"a.json"}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            &config_b_path,
+            br#"{"company_name":"company","username":"b","managed_routes":{"enabled":false,"cache_file":"b.json"}}"#,
+        )
+        .await
+        .unwrap();
+        let config_a = Config::read_only(config_a_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let config_b = Config::read_only(config_b_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let report = resolve_managed_routes_report(&config_a, false)
+            .await
+            .unwrap();
+        let wg_conf = crate::config::WgConf {
+            address: "10.0.0.2/24".to_string(),
+            address6: String::new(),
+            peer_address: "192.0.2.1:51820".to_string(),
+            mtu: 1420,
+            public_key: "public".to_string(),
+            private_key: "private".to_string(),
+            peer_key: "peer".to_string(),
+            allowed_ips: vec!["10.0.0.0/8".to_string()],
+            routes: vec!["10.0.0.0/8".to_string()],
+            dns: "10.0.0.53".to_string(),
+            protocol: 0,
+        };
+
+        mark_managed_routes_applied(&config_a, &report, &wg_conf, "generation-a", 1)
+            .await
+            .unwrap();
+
+        assert!(read_managed_routes_status(&config_a)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(read_managed_routes_status(&config_b)
+            .await
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn netstack_applied_status_has_no_system_routes_but_keeps_allowed_ips() {
+        let dir = unique_test_dir("corplink-managed-netstack-status");
+        let config_path = dir.join("config.json");
+        fs::write(
+            &config_path,
+            br#"{"company_name":"company","username":"user","socks5_listen":"127.0.0.1:1080","managed_routes":{"enabled":false}}"#,
+        )
+        .await
+        .unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let report = resolve_managed_routes_report(&config, false).await.unwrap();
+        let wg_conf = crate::config::WgConf {
+            address: "10.0.0.2/24".to_string(),
+            address6: String::new(),
+            peer_address: "192.0.2.1:51820".to_string(),
+            mtu: 1420,
+            public_key: "public".to_string(),
+            private_key: "private".to_string(),
+            peer_key: "peer".to_string(),
+            allowed_ips: vec!["10.0.0.0/8".to_string()],
+            routes: vec!["10.0.0.0/8".to_string()],
+            dns: "10.0.0.53".to_string(),
+            protocol: 0,
+        };
+
+        mark_managed_routes_applied(&config, &report, &wg_conf, "generation-netstack", 2)
+            .await
+            .unwrap();
+        let status = read_managed_routes_status(&config).await.unwrap().unwrap();
+
+        assert_eq!(status.mode, AppliedRouteMode::Netstack);
+        assert_eq!(status.allowed_ips, wg_conf.allowed_ips);
+        assert!(status.routes.is_empty());
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_failure_uses_matching_fresh_cache_without_marking_it_fresh() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for (status, body) in [
+                ("200 OK", br#"{"web":["192.0.2.0/24"]}"#.as_slice()),
+                ("500 Internal Server Error", br#"invalid"#.as_slice()),
+            ] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let dir = unique_test_dir("corplink-managed-fallback");
+        let config_path = dir.join("config.json");
+        let cache_path = dir.join("cache.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"managed_routes\":{{\"enabled\":true,\"cache_file\":\"{}\",\"stale_ttl_secs\":3600,\"sources\":[{{\"type\":\"github_meta\",\"name\":\"local\",\"keys\":[\"web\"],\"meta_url\":\"http://127.0.0.1:{port}/meta\"}}]}}}}",
+            cache_path.display()
+        );
+        fs::write(&config_path, source).await.unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let first = resolve_managed_routes_report(&config, true).await.unwrap();
+        let second = resolve_managed_routes_report(&config, false).await.unwrap();
+
+        assert_eq!(first.sources[0].status, RouteSourceStatus::Fresh);
+        assert_eq!(second.routes, first.routes);
+        assert_eq!(second.sources[0].status, RouteSourceStatus::Cache);
+        assert!(second.sources[0].error.is_some());
+        server.join().unwrap();
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    async fn run_cached_payload_fallback(payload: &'static [u8]) -> (RouteResolutionReport, i64) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for body in [br#"{"web":["192.0.2.0/24"]}"#.as_slice(), payload] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let dir = unique_test_dir("corplink-managed-payload");
+        let config_path = dir.join("config.json");
+        let cache_path = dir.join("cache.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"managed_routes\":{{\"enabled\":true,\"cache_file\":\"{}\",\"stale_ttl_secs\":3600,\"sources\":[{{\"type\":\"github_meta\",\"name\":\"local\",\"keys\":[\"web\"],\"meta_url\":\"http://127.0.0.1:{port}/meta\"}}]}}}}",
+            cache_path.display()
+        );
+        fs::write(&config_path, source).await.unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let first = resolve_managed_routes_report(&config, true).await.unwrap();
+        let first_resolved_at = first.sources[0].resolved_at;
+        let report = resolve_managed_routes_report(&config, false).await.unwrap();
+        server.join().unwrap();
+        fs::remove_dir_all(dir).await.unwrap();
+        (report, first_resolved_at)
+    }
+
+    #[tokio::test]
+    async fn http_200_empty_source_payload_uses_matching_cache() {
+        let (report, first_resolved_at) = run_cached_payload_fallback(br#"{"web":[]}"#).await;
+
+        assert_eq!(report.routes, vec!["192.0.2.0/24"]);
+        assert_eq!(report.sources[0].status, RouteSourceStatus::Cache);
+        assert_eq!(report.sources[0].resolved_at, first_resolved_at);
+    }
+
+    #[tokio::test]
+    async fn invalid_cidr_source_payload_uses_matching_cache_without_refresh() {
+        let (report, first_resolved_at) =
+            run_cached_payload_fallback(br#"{"web":["not-a-cidr"]}"#).await;
+
+        assert_eq!(report.routes, vec!["192.0.2.0/24"]);
+        assert_eq!(report.sources[0].status, RouteSourceStatus::Cache);
+        assert_eq!(report.sources[0].resolved_at, first_resolved_at);
+        assert!(report.sources[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn cold_http_429_is_exposed_as_rate_limited_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let dir = unique_test_dir("corplink-managed-429");
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"managed_routes\":{{\"enabled\":true,\"cache_file\":\"{}\",\"sources\":[{{\"type\":\"github_meta\",\"name\":\"local\",\"keys\":[\"web\"],\"meta_url\":\"http://127.0.0.1:{port}/meta\"}}]}}}}",
+            dir.join("cache.json").display()
+        );
+        fs::write(&config_path, source).await.unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let error = resolve_managed_routes_report(&config, false)
+            .await
+            .expect_err("cold 429 should fail");
+
+        assert_eq!(
+            crate::api::classify_error(&error),
+            crate::api::FailureKind::RateLimited
+        );
+        server.join().unwrap();
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_http_503_is_exposed_as_server_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let dir = unique_test_dir("corplink-managed-503");
+        let config_path = dir.join("config.json");
+        let source = format!(
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"managed_routes\":{{\"enabled\":true,\"cache_file\":\"{}\",\"sources\":[{{\"type\":\"github_meta\",\"name\":\"local\",\"keys\":[\"web\"],\"meta_url\":\"http://127.0.0.1:{port}/meta\"}}]}}}}",
+            dir.join("cache.json").display()
+        );
+        fs::write(&config_path, source).await.unwrap();
+        let config = Config::read_only(config_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let error = resolve_managed_routes_report(&config, false)
+            .await
+            .expect_err("cold 503 should fail");
+
+        assert_eq!(
+            crate::api::classify_error(&error),
+            crate::api::FailureKind::Server
+        );
+        server.join().unwrap();
+        fs::remove_dir_all(dir).await.unwrap();
+    }
 
     #[test]
     fn github_meta_routes_filter_ipv6_by_default() {

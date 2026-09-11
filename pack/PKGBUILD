@@ -11,7 +11,7 @@ license=('GPL-2.0-only')
 makedepends=('cargo' 'go' 'clang')
 source=(
   "$pkgname.$pkgver.tar.gz"
-  "wireguard-go"::"git+https://github.com/PinkD/wireguard-go"
+  "wireguard-go"::"git+https://github.com/PinkD/wireguard-go#commit=8936d2de0f2587fabeff9be7053eaef719d506d7"
 )
 
 # use SKIP to avoid update PKGBUILD everytime
@@ -23,9 +23,8 @@ backup=(etc/corplink/config.json)
 
 build() {
   # build libwg
-  cd "$srcdir/wireguard-go"
-  make libwg
-  cp libwg.* "$srcdir/$_pkgbase-$pkgver/libwg/"
+  cd "$srcdir/$_pkgbase-$pkgver"
+  CORPLINK_WG_SOURCE="$srcdir/wireguard-go" libwg/build.sh
 
   # build corplink-rs
   cd "$srcdir/$_pkgbase-$pkgver"
