@@ -117,24 +117,24 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "patch apply failed: $($patch.Name)" }
     }
 
-    if ($runTests) {
-        & go test ./libwg ./corplink
-        if ($LASTEXITCODE -ne 0) { throw "patched wireguard-go tests failed" }
-        if ($env:OS -ne "Windows_NT") {
-            if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) {
-                throw "python3 is required for the FFI probe on supported Unix hosts"
-            }
-            $probeLibrary = Join-Path $tempRoot "libwg-probe.so"
-            & go build -trimpath -buildmode=c-shared -o $probeLibrary ./libwg
-            if ($LASTEXITCODE -ne 0) { throw "patched FFI probe build failed" }
-            & python3 (Join-Path $repoRoot "tests/libwg_ffi_probe.py") $probeLibrary
-            if ($LASTEXITCODE -ne 0) { throw "patched FFI probe failed" }
-        } else {
-            Write-Host "corplink libwg build: skipping Unix-only FFI probe on Windows"
-        }
-    }
     Push-Location $patchedRoot
     try {
+        if ($runTests) {
+            & go test ./libwg ./corplink
+            if ($LASTEXITCODE -ne 0) { throw "patched wireguard-go tests failed" }
+            if ($env:OS -ne "Windows_NT") {
+                if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) {
+                    throw "python3 is required for the FFI probe on supported Unix hosts"
+                }
+                $probeLibrary = Join-Path $tempRoot "libwg-probe.so"
+                & go build -trimpath -buildmode=c-shared -o $probeLibrary ./libwg
+                if ($LASTEXITCODE -ne 0) { throw "patched FFI probe build failed" }
+                & python3 (Join-Path $repoRoot "tests/libwg_ffi_probe.py") $probeLibrary
+                if ($LASTEXITCODE -ne 0) { throw "patched FFI probe failed" }
+            } else {
+                Write-Host "corplink libwg build: skipping Unix-only FFI probe on Windows"
+            }
+        }
         & make -B -o generate-version libwg
         if ($LASTEXITCODE -ne 0) { throw "patched wireguard-go build failed" }
     } finally {

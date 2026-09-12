@@ -17,6 +17,7 @@ mod wg;
 use is_elevated;
 
 use std::env;
+use std::future::Future;
 use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -374,7 +375,7 @@ async fn run() -> Result<()> {
                     runtime_store.as_ref(),
                     &format!(
                         "local network acquisition failed: {message}; cleanup={}",
-                        format_cleanup_errors(None, remote_error)
+                        format_cleanup_errors(None, remote_error.as_ref())
                     ),
                 ));
             }
@@ -402,138 +403,23 @@ async fn run() -> Result<()> {
             }
         }
 
-        let handshake_result = tokio::select! {
-            result = session.wait_until_ready(handshake_deadline) => Some(result),
-            _ = shutdown_rx.changed() => None,
-        };
-        let handshake_age = match handshake_result {
-            None => {
-                if let Some(store) = runtime_store.as_ref() {
-                    let _ = store.mark_stopping();
-                }
-                let local_error = session.close().await.err();
-                let remote_error = disconnect_remote(&mut client, &wg_conf, platform.as_deref())
-                    .await
-                    .err();
-                let cleanup = format_cleanup_errors(local_error, remote_error);
-                if let Some(store) = runtime_store.as_ref() {
-                    if cleanup == "none" {
-                        let _ = store.mark_stopped();
-                    } else {
-                        let _ = store.mark_failed(&format!("stop cleanup incomplete: {cleanup}"));
-                    }
-                }
-                if cleanup != "none" {
-                    return Err(anyhow!("stop cleanup incomplete: {cleanup}"));
-                }
+        match supervise_session(
+            &mut session,
+            handshake_deadline,
+            &mut shutdown_rx,
+            runtime_store.as_ref(),
+            &mut recovery_policy,
+            Duration::from_secs(5),
+            || disconnect_remote(&mut client, &wg_conf, platform.as_deref()),
+        )
+        .await?
+        {
+            SessionOutcome::Retry => continue,
+            SessionOutcome::Stopped => {
+                log::info!("reach exit");
                 return Ok(());
             }
-            Some(result) => match result {
-                Ok(age) => age,
-                Err(error) => {
-                    let message = runtime::redact(&error.to_string());
-                    let local_error = session.close().await.err();
-                    let remote_error =
-                        disconnect_remote(&mut client, &wg_conf, platform.as_deref())
-                            .await
-                            .err();
-                    let cleanup = format_cleanup_errors(local_error, remote_error);
-                    match recovery_policy.on_transient_failure() {
-                        RetryDecision::Retry { attempt, delay } => {
-                            if let Some(store) = runtime_store.as_ref() {
-                                let _ = store
-                                    .mark_degraded("handshake deadline exceeded; retry pending");
-                            }
-                            log::warn!(
-                            "handshake retry {attempt}/3 after {}s: {message}; cleanup={cleanup}",
-                            delay.as_secs()
-                        );
-                            if wait_for_retry(delay, &mut shutdown_rx).await {
-                                if let Some(store) = runtime_store.as_ref() {
-                                    let _ = store.mark_stopping();
-                                    let _ = store.mark_stopped();
-                                }
-                                return Ok(());
-                            }
-                            continue;
-                        }
-                        RetryDecision::Reauthenticate | RetryDecision::Fail => {}
-                    }
-                    return Err(terminal_failure(
-                        runtime_store.as_ref(),
-                        &format!("VPN never became ready: {message}; cleanup={cleanup}"),
-                    ));
-                }
-            },
-        };
-
-        if let Some(store) = runtime_store.as_ref() {
-            let _ = store.mark_ready(handshake_age);
         }
-        recovery_policy.reset_after_ready();
-
-        let health_result = tokio::select! {
-            _ = shutdown_rx.changed() => None,
-            result = monitor_network(&session, runtime_store.as_ref()) => Some(result),
-        };
-
-        if health_result.is_none() {
-            if let Some(store) = runtime_store.as_ref() {
-                let _ = store.mark_stopping();
-            }
-            let local_error = session.close().await.err();
-            let remote_error = disconnect_remote(&mut client, &wg_conf, platform.as_deref())
-                .await
-                .err();
-            let cleanup = format_cleanup_errors(local_error, remote_error);
-            if let Some(store) = runtime_store.as_ref() {
-                if cleanup == "none" {
-                    let _ = store.mark_stopped();
-                } else {
-                    let _ = store.mark_failed(&format!("stop cleanup incomplete: {cleanup}"));
-                }
-            }
-            if cleanup != "none" {
-                return Err(anyhow!("stop cleanup incomplete: {cleanup}"));
-            }
-            log::info!("reach exit");
-            return Ok(());
-        }
-
-        let health_error = match health_result.expect("health result is present") {
-            Ok(()) => unreachable!("health monitor only returns after a failure"),
-            Err(error) => error,
-        };
-        let local_error = session.close().await.err();
-        let remote_error = disconnect_remote(&mut client, &wg_conf, platform.as_deref())
-            .await
-            .err();
-        let cleanup = format_cleanup_errors(local_error, remote_error);
-        let message = runtime::redact(&health_error.to_string());
-        match recovery_policy.on_transient_failure() {
-            RetryDecision::Retry { attempt, delay } => {
-                if let Some(store) = runtime_store.as_ref() {
-                    let _ = store.mark_degraded(&format!("connection health failed: {message}"));
-                }
-                log::warn!(
-                    "connection health retry {attempt}/3 after {}s: {message}; cleanup={cleanup}",
-                    delay.as_secs()
-                );
-                if wait_for_retry(delay, &mut shutdown_rx).await {
-                    if let Some(store) = runtime_store.as_ref() {
-                        let _ = store.mark_stopping();
-                        let _ = store.mark_stopped();
-                    }
-                    return Ok(());
-                }
-                continue;
-            }
-            RetryDecision::Reauthenticate | RetryDecision::Fail => {}
-        }
-        return Err(terminal_failure(
-            runtime_store.as_ref(),
-            &format!("connection health failed: {message}; cleanup={cleanup}"),
-        ));
     }
 }
 
@@ -580,7 +466,133 @@ async fn disconnect_remote(
     }
 }
 
-fn format_cleanup_errors(local: Option<anyhow::Error>, remote: Option<anyhow::Error>) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionOutcome {
+    Retry,
+    Stopped,
+}
+
+enum SessionEnd {
+    Stopped,
+    Failed {
+        context: &'static str,
+        message: String,
+    },
+}
+
+async fn supervise_session<F, Fut>(
+    session: &mut NetworkSession,
+    handshake_deadline: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    runtime_store: Option<&RuntimeStore>,
+    recovery_policy: &mut RecoveryPolicy,
+    health_interval: Duration,
+    disconnect: F,
+) -> Result<SessionOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let handshake_result = tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => None,
+        result = session.wait_until_ready(handshake_deadline) => Some(result),
+    };
+    let end = match handshake_result {
+        None => SessionEnd::Stopped,
+        Some(Ok(handshake_age)) => {
+            if let Some(store) = runtime_store {
+                let _ = store.mark_ready(handshake_age);
+            }
+            recovery_policy.reset_after_ready();
+
+            match tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => None,
+                result = monitor_network(session, runtime_store, health_interval) => Some(result),
+            } {
+                None => SessionEnd::Stopped,
+                Some(Ok(())) => unreachable!("health monitor only returns after a failure"),
+                Some(Err(error)) => SessionEnd::Failed {
+                    context: "connection health failed",
+                    message: runtime::redact(&error.to_string()),
+                },
+            }
+        }
+        Some(Err(error)) => SessionEnd::Failed {
+            context: "VPN never became ready",
+            message: runtime::redact(&error.to_string()),
+        },
+    };
+
+    if matches!(end, SessionEnd::Stopped) {
+        if let Some(store) = runtime_store {
+            let _ = store.mark_stopping();
+        }
+    }
+    // Local resources must be released before remote disconnect. A retry is
+    // safe only after this first step succeeds.
+    let local_error = session.close().await.err();
+    let remote_error = disconnect().await.err();
+    let cleanup = format_cleanup_errors(local_error.as_ref(), remote_error.as_ref());
+
+    match end {
+        SessionEnd::Stopped => {
+            if cleanup != "none" {
+                return Err(terminal_failure(
+                    runtime_store,
+                    &format!("stop cleanup incomplete: {cleanup}"),
+                ));
+            }
+            if let Some(store) = runtime_store {
+                let _ = store.mark_stopped();
+            }
+            Ok(SessionOutcome::Stopped)
+        }
+        SessionEnd::Failed { context, message } => {
+            if local_error.is_some() {
+                return Err(terminal_failure(
+                    runtime_store,
+                    &format!("{context}; local cleanup failed: {cleanup}"),
+                ));
+            }
+
+            match recovery_policy.on_transient_failure() {
+                RetryDecision::Retry { attempt, delay } => {
+                    if let Some(store) = runtime_store {
+                        let _ = store.mark_degraded(&format!("{context}; retry pending"));
+                    }
+                    log::warn!(
+                        "{context}; retry {attempt}/3 after {}s: {message}; cleanup={cleanup}",
+                        delay.as_secs()
+                    );
+                    if wait_for_retry(delay, shutdown_rx).await {
+                        if let Some(store) = runtime_store {
+                            let _ = store.mark_stopping();
+                        }
+                        if cleanup != "none" {
+                            return Err(terminal_failure(
+                                runtime_store,
+                                &format!("stop cleanup incomplete: {cleanup}"),
+                            ));
+                        }
+                        if let Some(store) = runtime_store {
+                            let _ = store.mark_stopped();
+                        }
+                        return Ok(SessionOutcome::Stopped);
+                    }
+                    Ok(SessionOutcome::Retry)
+                }
+                RetryDecision::Reauthenticate | RetryDecision::Fail => Err(terminal_failure(
+                    runtime_store,
+                    &format!("{context}: {message}; cleanup={cleanup}"),
+                )),
+            }
+        }
+    }
+}
+
+fn format_cleanup_errors(local: Option<&anyhow::Error>, remote: Option<&anyhow::Error>) -> String {
     let mut errors = Vec::new();
     if let Some(error) = local {
         errors.push(format!("local: {}", runtime::redact(&error.to_string())));
@@ -598,9 +610,10 @@ fn format_cleanup_errors(local: Option<anyhow::Error>, remote: Option<anyhow::Er
 async fn monitor_network(
     session: &NetworkSession,
     runtime_store: Option<&RuntimeStore>,
+    interval: Duration,
 ) -> Result<()> {
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(interval).await;
         match session.health()? {
             wg::WgHealth::Healthy(age) => {
                 log::info!("VPN health is current; handshake age={}s", age.as_secs());
@@ -693,4 +706,306 @@ fn print_version() {
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use network_session::AdapterFuture;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FakeAdapter {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        stop_failures: usize,
+        health: Arc<Mutex<Vec<wg::WgHealth>>>,
+    }
+
+    impl network_session::NetworkAdapter for FakeAdapter {
+        fn start(&mut self, _conf: &WgConf) -> Result<()> {
+            self.events.lock().unwrap().push("start");
+            Ok(())
+        }
+
+        fn configure<'a>(&'a mut self, _conf: &'a WgConf) -> AdapterFuture<'a> {
+            let events = Arc::clone(&self.events);
+            Box::pin(async move {
+                events.lock().unwrap().push("configure");
+                Ok(())
+            })
+        }
+
+        fn set_dns(&mut self, _dns: &str) -> Result<()> {
+            self.events.lock().unwrap().push("set_dns");
+            Ok(())
+        }
+
+        fn restore_dns(&mut self) -> Result<()> {
+            self.events.lock().unwrap().push("restore_dns");
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.events.lock().unwrap().push("stop");
+            if self.stop_failures > 0 {
+                self.stop_failures -= 1;
+                Err(anyhow!("fake network stop failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn health(&self) -> Result<wg::WgHealth> {
+            let mut health = self.health.lock().unwrap();
+            if health.len() > 1 {
+                Ok(health.remove(0))
+            } else {
+                Ok(health.first().cloned().unwrap_or(wg::WgHealth::NoHandshake))
+            }
+        }
+    }
+
+    fn test_conf() -> WgConf {
+        WgConf {
+            address: "100.64.0.2/32".to_string(),
+            address6: String::new(),
+            peer_address: "198.51.100.1:443".to_string(),
+            mtu: 1420,
+            public_key: "public".to_string(),
+            private_key: "private".to_string(),
+            peer_key: "peer".to_string(),
+            allowed_ips: vec!["10.0.0.0/8".to_string()],
+            routes: vec!["10.0.0.0/8".to_string()],
+            dns: "10.0.0.53".to_string(),
+            protocol: 0,
+        }
+    }
+
+    fn test_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "corplink-main-{name}-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    async fn session_with_stop_failures(
+        stop_failures: usize,
+        health: Vec<wg::WgHealth>,
+    ) -> (NetworkSession, Arc<Mutex<Vec<&'static str>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let adapter = FakeAdapter {
+            events: Arc::clone(&events),
+            stop_failures,
+            health: Arc::new(Mutex::new(health)),
+        };
+        let conf = test_conf();
+        let session = NetworkSession::acquire_with_adapter(
+            "test",
+            &conf,
+            Box::new(adapter),
+            false,
+            "10.0.0.53",
+        )
+        .await
+        .unwrap();
+        (session, events)
+    }
+
+    #[tokio::test]
+    async fn handshake_cleanup_failure_stops_supervision_before_retry() {
+        let (mut session, events) =
+            session_with_stop_failures(1, vec![wg::WgHealth::NoHandshake]).await;
+        let (_sender, mut shutdown_rx) = watch::channel(false);
+        let state_path = test_path("handshake-cleanup-failure");
+        let store = RuntimeStore::new(&state_path, "generation-handshake-failure");
+        let mut policy = RecoveryPolicy::new(3);
+        let remote_calls = Arc::new(Mutex::new(0_u32));
+        let remote_calls_for_cleanup = Arc::clone(&remote_calls);
+        let events_for_cleanup = Arc::clone(&events);
+
+        let result = supervise_session(
+            &mut session,
+            Duration::ZERO,
+            &mut shutdown_rx,
+            Some(&store),
+            &mut policy,
+            Duration::ZERO,
+            move || async move {
+                *remote_calls_for_cleanup.lock().unwrap() += 1;
+                events_for_cleanup.lock().unwrap().push("remote");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(_)));
+        assert_eq!(*remote_calls.lock().unwrap(), 1);
+        assert!(!session.is_closed());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["start", "configure", "stop", "remote"]
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["phase"], "failed");
+        assert_eq!(state["intent"], "failed");
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn health_cleanup_failure_stops_supervision_before_retry() {
+        let (mut session, events) = session_with_stop_failures(
+            1,
+            vec![
+                wg::WgHealth::Healthy(Duration::from_secs(1)),
+                wg::WgHealth::Stale(Duration::from_secs(301)),
+            ],
+        )
+        .await;
+        let (_sender, mut shutdown_rx) = watch::channel(false);
+        let state_path = test_path("health-cleanup-failure");
+        let store = RuntimeStore::new(&state_path, "generation-health-failure");
+        let mut policy = RecoveryPolicy::new(3);
+        let remote_calls = Arc::new(Mutex::new(0_u32));
+        let remote_calls_for_cleanup = Arc::clone(&remote_calls);
+        let events_for_cleanup = Arc::clone(&events);
+
+        let result = supervise_session(
+            &mut session,
+            Duration::ZERO,
+            &mut shutdown_rx,
+            Some(&store),
+            &mut policy,
+            Duration::ZERO,
+            move || async move {
+                *remote_calls_for_cleanup.lock().unwrap() += 1;
+                events_for_cleanup.lock().unwrap().push("remote");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(_)));
+        assert_eq!(*remote_calls.lock().unwrap(), 1);
+        assert!(!session.is_closed());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["start", "configure", "stop", "remote"]
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["phase"], "failed");
+        assert_eq!(state["intent"], "failed");
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn stop_cleanup_failure_cannot_publish_stopped() {
+        let (mut session, _events) =
+            session_with_stop_failures(1, vec![wg::WgHealth::NoHandshake]).await;
+        let state_path = test_path("stop-failure");
+        let store = RuntimeStore::new(&state_path, "generation-stop-failure");
+        let (sender, mut shutdown_rx) = watch::channel(false);
+        sender.send(true).unwrap();
+        let mut policy = RecoveryPolicy::new(3);
+
+        let result = supervise_session(
+            &mut session,
+            Duration::from_secs(30),
+            &mut shutdown_rx,
+            Some(&store),
+            &mut policy,
+            Duration::ZERO,
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(matches!(result, Err(_)));
+        assert!(!session.is_closed());
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["phase"], "failed");
+        assert_eq!(state["intent"], "failed");
+        assert_ne!(state["phase"], "stopped");
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn successful_handshake_cleanup_returns_retry() {
+        let (mut session, events) =
+            session_with_stop_failures(0, vec![wg::WgHealth::NoHandshake]).await;
+        let (_sender, mut shutdown_rx) = watch::channel(false);
+        let state_path = test_path("handshake-retry");
+        let store = RuntimeStore::new(&state_path, "generation-handshake-retry");
+        let mut policy = RecoveryPolicy::new(3);
+        let events_for_cleanup = Arc::clone(&events);
+
+        let result = supervise_session(
+            &mut session,
+            Duration::ZERO,
+            &mut shutdown_rx,
+            Some(&store),
+            &mut policy,
+            Duration::ZERO,
+            move || async move {
+                events_for_cleanup.lock().unwrap().push("remote");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Ok(SessionOutcome::Retry)));
+        assert!(session.is_closed());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["start", "configure", "stop", "remote"]
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["phase"], "degraded");
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn successful_shutdown_cleanup_returns_stopped() {
+        let (mut session, events) =
+            session_with_stop_failures(0, vec![wg::WgHealth::NoHandshake]).await;
+        let state_path = test_path("shutdown-stopped");
+        let store = RuntimeStore::new(&state_path, "generation-shutdown-stopped");
+        let (sender, mut shutdown_rx) = watch::channel(false);
+        sender.send(true).unwrap();
+        let mut policy = RecoveryPolicy::new(3);
+        let events_for_cleanup = Arc::clone(&events);
+
+        let result = supervise_session(
+            &mut session,
+            Duration::from_secs(30),
+            &mut shutdown_rx,
+            Some(&store),
+            &mut policy,
+            Duration::ZERO,
+            move || async move {
+                events_for_cleanup.lock().unwrap().push("remote");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Ok(SessionOutcome::Stopped)));
+        assert!(session.is_closed());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["start", "configure", "stop", "remote"]
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["phase"], "stopped");
+        assert_eq!(state["intent"], "stopped");
+        let _ = fs::remove_file(state_path);
+    }
 }

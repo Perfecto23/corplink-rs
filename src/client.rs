@@ -214,16 +214,16 @@ impl Client {
         if loaded_cookie_store.corrupted {
             log::warn!("cookie store is unreadable; requiring login");
             client.conf.state = Some(State::Init);
-            client.conf.save_session_sync()?;
+            client.conf.save_session()?;
         } else if migrate_legacy_cookie {
             client.save_cookie()?;
         }
         Ok(client)
     }
 
-    async fn change_state(&mut self, state: State) -> Result<()> {
+    fn change_state(&mut self, state: State) -> Result<()> {
         self.conf.state = Some(state);
-        self.conf.save_session().await?;
+        self.conf.save_session()?;
         Ok(())
     }
 
@@ -253,7 +253,7 @@ impl Client {
         self.cookie_corrupted_path = None;
         if self.conf.legacy_cookie_migration {
             self.conf.legacy_cookie_migration = false;
-            self.conf.save_session_sync()?;
+            self.conf.save_session()?;
         }
         Ok(())
     }
@@ -286,7 +286,7 @@ impl Client {
             let status = resp.status().as_u16();
             let failure = ClientFailure::http(api.as_str(), status);
             if failure.kind().requires_login() {
-                self.change_state(State::Init).await?;
+                self.change_state(State::Init)?;
             }
             return Err(anyhow::Error::new(failure));
         }
@@ -558,7 +558,7 @@ impl Client {
                     )));
                 }
                 log::info!("login success");
-                self.change_state(State::Login).await?;
+                self.change_state(State::Login)?;
 
                 // fetch the TOTP secret so 2fa codes can be generated locally,
                 // mirroring the legacy login() flow. the v1 backend serves the
@@ -570,7 +570,7 @@ impl Client {
                             if k == "secret" {
                                 log::info!("received TOTP enrollment");
                                 self.conf.code = Some(v.to_string());
-                                self.conf.save_session().await?;
+                                self.conf.save_session()?;
                                 break;
                             }
                         }
@@ -611,17 +611,17 @@ impl Client {
             let otp_uri = otp_uri?;
             if otp_uri.is_empty() {
                 log::info!("no otp code from server, will ask for 2fa code when connecting");
-                self.change_state(State::Login).await?;
+                self.change_state(State::Login)?;
                 return Ok(());
             }
-            self.change_state(State::Login).await?;
+            self.change_state(State::Login)?;
 
             let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
             for (k, v) in url.query_pairs() {
                 if k == "secret" {
                     log::info!("received TOTP enrollment");
                     self.conf.code = Some(v.to_string());
-                    self.conf.save_session().await?;
+                    self.conf.save_session()?;
                     break;
                 }
             }
@@ -784,7 +784,6 @@ impl Client {
 
     async fn handle_logout_err(&mut self, operation: &'static str, code: i32) -> Result<()> {
         self.change_state(State::Init)
-            .await
             .context("failed to reset state after authentication expiry")?;
         Err(anyhow::Error::new(ClientFailure::api(operation, code)))
     }
@@ -1322,7 +1321,7 @@ impl Client {
             .send()
             .await
             .map_err(|_| anyhow::Error::new(ClientFailure::transport(ApiName::Logout.as_str())));
-        let state_result = self.change_state(State::Init).await;
+        let state_result = self.change_state(State::Init);
         state_result.context("failed to persist local logout state")?;
         let resp = response?;
         if resp.status().is_success() || resp.status().is_redirection() {
@@ -1494,7 +1493,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
         let cookie_path = cookie_file_path_for_identity(
             config_path.to_str().unwrap(),
             config.interface_name.as_deref().unwrap(),
@@ -1545,7 +1544,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
 
         let mut client = Client::new(config).unwrap();
         assert!(!client.need_login());
@@ -1654,7 +1653,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
 
         let mut client = Client::new(config).unwrap();
         let wg = client.connect_vpn().await.unwrap();
@@ -1707,7 +1706,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
 
         let mut client = Client::new(config).unwrap();
         assert!(!client.need_login());
@@ -1808,7 +1807,7 @@ mod tests {
             .await
             .unwrap();
         second.state = Some(State::Login);
-        second.save_session().await.unwrap();
+        second.save_session().unwrap();
         let mut first_client = Client::new(second).unwrap();
         let first_error = match first_client.connect_vpn().await {
             Ok(_) => panic!("expired account must fail"),
@@ -1824,7 +1823,7 @@ mod tests {
             .await
             .unwrap();
         restarted.state = Some(State::Login);
-        restarted.save_session().await.unwrap();
+        restarted.save_session().unwrap();
         let mut second_client = Client::new(restarted).unwrap();
         let _second_error = match second_client.connect_vpn().await {
             Ok(_) => panic!("expired account must fail after restart"),
@@ -1873,7 +1872,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
         let cookie_path = cookie_file_path_for_identity(
             config_path.to_str().unwrap(),
             config.interface_name.as_deref().unwrap(),
@@ -1942,7 +1941,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
         let legacy_path = cookie_file_path(
             config_path.to_str().unwrap(),
             config.interface_name.as_deref().unwrap(),
@@ -2103,7 +2102,7 @@ mod tests {
             .await
             .unwrap();
         config.state = Some(State::Login);
-        config.save_session().await.unwrap();
+        config.save_session().unwrap();
         let mut client = Client::new(config).unwrap();
         assert!(!client.need_login());
 

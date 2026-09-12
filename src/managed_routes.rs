@@ -161,10 +161,6 @@ struct SourceCacheEntry {
     error: Option<String>,
 }
 
-pub async fn resolve_managed_routes(conf: &Config) -> Result<Vec<String>> {
-    Ok(resolve_managed_routes_report(conf, true).await?.routes)
-}
-
 pub async fn resolve_managed_routes_report(
     conf: &Config,
     write_cache: bool,

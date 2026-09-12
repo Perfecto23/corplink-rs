@@ -44,22 +44,6 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RuntimeSnapshot {
-    pub schema_version: u32,
-    pub generation: String,
-    pub intent: String,
-    pub phase: Phase,
-    pub ready: bool,
-    pub pid: u32,
-    pub process_start: Option<String>,
-    pub reason: String,
-    pub handshake_age_secs: Option<u64>,
-    pub restart_count: u32,
-    pub last_exit: Option<i32>,
-    pub updated_at: String,
-}
-
 #[derive(Clone, Debug)]
 pub struct RuntimeStore {
     path: PathBuf,
@@ -554,11 +538,11 @@ mod tests {
         .unwrap();
 
         store.mark_ready(Duration::from_secs(4)).unwrap();
-        let snapshot: RuntimeSnapshot =
+        let snapshot: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(snapshot.phase, Phase::Ready);
-        assert!(snapshot.ready);
-        assert_eq!(snapshot.handshake_age_secs, Some(4));
+        assert_eq!(snapshot["phase"], "ready");
+        assert!(snapshot["ready"].as_bool().unwrap());
+        assert_eq!(snapshot["handshake_age_secs"], 4);
         let _ = fs::remove_file(state_path);
     }
 

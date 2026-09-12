@@ -169,6 +169,8 @@ system domain 使用的 plist 会通过 `sudo install` 发布为 `root:wheel`、
 scripts/corplink-traffic.sh foreground
 ```
 
+前台会话也登记运行身份和状态，可从另一终端执行 `status` 或 `stop`。已有前台会话时，`start` 不会重复启动；按 Ctrl-C 会等待清理完成后退出。
+
 ## 5. 日常命令
 
 ```bash
@@ -176,7 +178,7 @@ scripts/corplink-traffic.sh status      # 查看当前运行身份、健康与�
 scripts/corplink-traffic.sh restart     # 修改 config.local.json 后重启刷新路由
 scripts/corplink-traffic.sh logs        # 查看最近日志
 scripts/corplink-traffic.sh logs -f     # 跟随日志
-scripts/corplink-traffic.sh stop        # 停止后台进程
+scripts/corplink-traffic.sh stop        # 停止当前 VPN 会话
 ```
 
 `status` 仅在当前进程身份和健康观测有效时返回 0；停止、失效或观测过期时返回非零。它不再通过重新访问远端来猜测已应用路由；实时目标访问用 `test-host` 检查。

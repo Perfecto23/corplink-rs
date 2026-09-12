@@ -1,5 +1,5 @@
 use std::ffi::{c_void, CStr, CString};
-use std::time::{self, Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -254,61 +254,6 @@ impl UAPIClient {
         let data = uapi(b"get=1\n\n")
             .with_context(|| format!("failed to query wireguard health for {}", self.name))?;
         parse_wg_health(&data, stale_after)
-    }
-
-    pub async fn wait_for_handshake(
-        &self,
-        deadline: Duration,
-        stale_after: Duration,
-    ) -> Result<Duration> {
-        let started = tokio::time::Instant::now();
-        loop {
-            match self.health(stale_after)? {
-                WgHealth::Healthy(age) => return Ok(age),
-                WgHealth::NoHandshake => {}
-                WgHealth::Stale(age) => {
-                    log::warn!("wireguard handshake is stale: {}s", age.as_secs());
-                }
-            }
-            if started.elapsed() >= deadline {
-                return Err(anyhow!(
-                    "wireguard handshake was not observed before the {}s deadline",
-                    deadline.as_secs()
-                ));
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-
-    pub async fn check_wg_connection(&mut self) {
-        // default refresh key timeout of wg is 2 min
-        // we set wg connection timeout to 5 min
-        let interval = time::Duration::from_secs(5 * 60);
-        let mut ticker = tokio::time::interval(interval);
-        let mut timeout = false;
-        // consume the first tick
-        ticker.tick().await;
-        while !timeout {
-            ticker.tick().await;
-
-            let name = self.name.as_str();
-            match self.health(interval) {
-                Ok(WgHealth::Healthy(age)) => {
-                    log::info!("last handshake age for {} is {}s", name, age.as_secs());
-                }
-                Ok(WgHealth::NoHandshake) => {
-                    log::warn!("wireguard {} has not completed a handshake", name);
-                }
-                Ok(WgHealth::Stale(age)) => {
-                    log::warn!("last handshake for {} is stale at {}s", name, age.as_secs());
-                    timeout = true;
-                }
-                Err(err) => {
-                    log::warn!("failed to observe wireguard {}: {}", name, err);
-                    timeout = true;
-                }
-            }
-        }
     }
 }
 

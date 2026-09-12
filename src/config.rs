@@ -296,7 +296,7 @@ impl Config {
             update_session = true;
         }
         if update_session && (!session_path.exists() || session_usable) {
-            conf.save_session().await?;
+            conf.save_session()?;
         }
         Ok(conf)
     }
@@ -361,17 +361,7 @@ impl Config {
         self.legacy_cookie_migration
     }
 
-    pub async fn save_session(&self) -> Result<()> {
-        let path = self.session_path()?;
-        state::save_session(&path, &self.session_snapshot()).with_context(|| {
-            format!(
-                "failed to persist authentication session state {}",
-                path.display()
-            )
-        })
-    }
-
-    pub fn save_session_sync(&self) -> Result<()> {
+    pub fn save_session(&self) -> Result<()> {
         let path = self.session_path()?;
         state::save_session(&path, &self.session_snapshot()).with_context(|| {
             format!(

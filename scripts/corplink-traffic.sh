@@ -20,7 +20,14 @@ STATE_LOCK_DIR="$STATE_FILE.lock"
 EVENT_FILE="$RUN_DIR/corplink-runtime-events.log"
 LOG_FILE="$RUN_DIR/corplink-traffic.log"
 STOP_FILE="$RUN_DIR/corplink-traffic.stop"
-LOCK_DIR="$RUN_DIR/corplink-traffic.lock"
+LOCK_FILE="$RUN_DIR/corplink-traffic.lockfile"
+# Versions before the file-descriptor lock used this directory as the
+# operation lock. Keep it as a legacy marker and retire it only while the
+# kernel lock is held, so two new contenders cannot race its cleanup.
+LEGACY_LOCK_DIR="$RUN_DIR/corplink-traffic.lock"
+LOCK_FD=9
+LOCK_FD_OPEN=0
+LOCK_HELD=0
 LOG_LEVEL="${RUST_LOG:-info}"
 TEST_REPO="${TEST_REPO:-}"
 TEST_HOST="${TEST_HOST:-}"
@@ -47,7 +54,8 @@ STATE_LOCK_DIR="$STATE_FILE.lock"
 EVENT_FILE="$RUN_DIR/corplink-runtime-events.log"
 LOG_FILE="$(absolutize_path "$LOG_FILE")"
 STOP_FILE="$RUN_DIR/corplink-traffic.stop"
-LOCK_DIR="$RUN_DIR/corplink-traffic.lock"
+LOCK_FILE="$RUN_DIR/corplink-traffic.lockfile"
+LEGACY_LOCK_DIR="$RUN_DIR/corplink-traffic.lock"
 
 usage() {
   cat <<'EOF'
@@ -198,16 +206,15 @@ data = {
 }
 pathlib.Path(path).write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
+  chmod 0644 "$tmp"
   mv -f "$tmp" "$STATE_FILE"
   release_state_lock
 }
 
 state_update() {
   local tmp="$STATE_FILE.$$.$RANDOM.tmp"
-  local attempt
   acquire_state_lock || return 1
-  for attempt in {1..100}; do
-    if python3 - "$STATE_FILE" "$tmp" "$@" <<'PY'
+  if ! python3 - "$STATE_FILE" "$tmp" "$@" <<'PY'
 import json
 import pathlib
 import sys
@@ -218,7 +225,8 @@ try:
     data = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
 except FileNotFoundError:
     data = {}
-except json.JSONDecodeError:
+except json.JSONDecodeError as error:
+    print(f"could not parse runtime state {source}: {error}", file=sys.stderr)
     raise SystemExit(75)
 if len(pairs) % 2:
     raise SystemExit("state_update requires key/value pairs")
@@ -237,16 +245,15 @@ for index in range(0, len(pairs), 2):
 data["updated_at"] = str(time.time())
 pathlib.Path(target).write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
-    then
-      mv -f "$tmp" "$STATE_FILE"
-      release_state_lock
-      return 0
-    fi
-    sleep 0.01
-  done
-  rm -f "$tmp"
+  then
+    rm -f "$tmp"
+    release_state_lock
+    return 1
+  fi
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
   release_state_lock
-  return 1
+  return 0
 }
 
 state_get() {
@@ -340,21 +347,98 @@ notify_terminal_once() {
 acquire_lock() {
   mkdir -p "$RUN_DIR"
   local deadline=$((SECONDS + ${CORPLINK_LOCK_TIMEOUT_SECS:-10}))
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  if [[ ! -e "$LOCK_FILE" ]]; then
+    if ! (umask 022; : >"$LOCK_FILE"); then
+      echo "could not create corplink runtime operation lock: $LOCK_FILE" >&2
+      return 1
+    fi
+    chmod 0644 "$LOCK_FILE" 2>/dev/null || true
+  fi
+  if ! exec 9<"$LOCK_FILE"; then
+    echo "could not open corplink runtime operation lock: $LOCK_FILE" >&2
+    return 1
+  fi
+  LOCK_FD_OPEN=1
+  while true; do
+    if python3 - "$LOCK_FD" <<'PY'
+import fcntl
+import sys
+
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(1)
+PY
+    then
+      LOCK_HELD=1
+      # A legacy directory lock has no kernel lock to coordinate with us.
+      # Its owner PID is authoritative only while this new lock is held.
+      if [[ -d "$LEGACY_LOCK_DIR" ]]; then
+        local owner
+        owner=""
+        if [[ -f "$LEGACY_LOCK_DIR/pid" ]]; then
+          owner="$(sed -n '1p' "$LEGACY_LOCK_DIR/pid" || true)"
+        fi
+        if [[ "$owner" =~ ^[0-9]+$ ]] && process_alive "$owner"; then
+          python3 - "$LOCK_FD" <<'PY'
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
+PY
+          LOCK_HELD=0
+          if (( SECONDS >= deadline )); then
+            exec 9>&-
+            LOCK_FD_OPEN=0
+            echo "another corplink runtime operation is in progress: $LEGACY_LOCK_DIR" >&2
+            return 1
+          fi
+          sleep 0.05
+          continue
+        fi
+        rm -f "$LEGACY_LOCK_DIR/pid"
+        if ! rmdir "$LEGACY_LOCK_DIR" 2>/dev/null; then
+          python3 - "$LOCK_FD" <<'PY'
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
+PY
+          LOCK_HELD=0
+          exec 9>&-
+          LOCK_FD_OPEN=0
+          echo "could not retire legacy corplink runtime operation lock: $LEGACY_LOCK_DIR" >&2
+          return 1
+        fi
+      fi
+      trap 'release_lock' EXIT
+      return 0
+    fi
     if (( SECONDS >= deadline )); then
-      echo "another corplink runtime operation is in progress: $LOCK_DIR" >&2
+      exec 9>&-
+      LOCK_FD_OPEN=0
+      echo "another corplink runtime operation is in progress: $LOCK_FILE" >&2
       return 1
     fi
     sleep 0.05
   done
-  printf '%s\n' "$$" > "$LOCK_DIR/pid"
-  trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 }
 
 release_lock() {
   trap - EXIT
-  rm -f "$LOCK_DIR/pid"
-  rmdir "$LOCK_DIR" 2>/dev/null || true
+  if (( LOCK_HELD == 1 )); then
+    python3 - "$LOCK_FD" <<'PY'
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
+PY
+    LOCK_HELD=0
+  fi
+  if (( LOCK_FD_OPEN == 1 )); then
+    exec 9>&-
+    LOCK_FD_OPEN=0
+  fi
 }
 
 acquire_state_lock() {
@@ -547,6 +631,10 @@ send_term() {
 run_supervisor() {
   local config="$1"
   local generation="$2"
+  if [[ "${CORPLINK_FOREGROUND:-0}" == "1" ]]; then
+    # sudo preserves standard input but closes inherited extra descriptors.
+    exec 8<&0
+  fi
   local supervisor_pid="$$"
   local backend="${CORPLINK_RUNTIME_BACKEND:-process}"
   local child_pid=""
@@ -594,7 +682,7 @@ run_supervisor() {
     state_update intent stopped phase stopped ready "<false>" pid "<null>" supervisor_pid "<null>" reason "stopped by user" last_exit "<null>" || true
     rm -f "$CHILD_PID_FILE" "$STOP_FILE" "$PID_FILE"
     exit 0
-  ' TERM INT
+  ' TERM
 
   state_update intent running phase starting ready "<false>" pid "<null>" supervisor_pid "$supervisor_pid" generation "$generation" backend "$backend" supervisor_crash_count "$supervisor_crashes" reason "supervisor started" restart_count 0 last_exit "<null>"
   write_pid_file "$supervisor_pid"
@@ -606,13 +694,23 @@ run_supervisor() {
     fi
 
     state_update intent running phase connecting ready "<false>" pid "<null>" supervisor_pid "$supervisor_pid" generation "$generation" backend "$backend" reason "starting child" restart_count "$restart_count" last_exit "<null>"
-    (
-      export CORPLINK_RUNTIME_STATE="$STATE_FILE"
-      export CORPLINK_RUNTIME_GENERATION="$generation"
-      export CORPLINK_RUNTIME_LOG="$LOG_FILE"
-      export RUST_LOG="$LOG_LEVEL"
-      exec "$BIN" "$config"
-    ) >> "$LOG_FILE" 2>&1 &
+    if [[ "${CORPLINK_FOREGROUND:-0}" == "1" ]]; then
+      (
+        export CORPLINK_RUNTIME_STATE="$STATE_FILE"
+        export CORPLINK_RUNTIME_GENERATION="$generation"
+        export CORPLINK_RUNTIME_LOG="$LOG_FILE"
+        export RUST_LOG="$LOG_LEVEL"
+        exec "$BIN" "$config" <&8
+      ) &
+    else
+      (
+        export CORPLINK_RUNTIME_STATE="$STATE_FILE"
+        export CORPLINK_RUNTIME_GENERATION="$generation"
+        export CORPLINK_RUNTIME_LOG="$LOG_FILE"
+        export RUST_LOG="$LOG_LEVEL"
+        exec "$BIN" "$config"
+      ) >> "$LOG_FILE" 2>&1 &
+    fi
     child_pid=$!
     printf '%s\n' "$child_pid" > "$CHILD_PID_FILE"
 
@@ -978,7 +1076,7 @@ start_process() {
     CORPLINK_NOTIFY_UID="$CORPLINK_NOTIFY_UID" \
     CORPLINK_LAUNCHCTL="${CORPLINK_LAUNCHCTL:-launchctl}" \
     CORPLINK_OSASCRIPT="${CORPLINK_OSASCRIPT:-osascript}" \
-    "$ROOT/scripts/corplink-traffic.sh" _supervise "$CONFIG" "$generation" >> "$LOG_FILE" 2>&1 &
+    "$ROOT/scripts/corplink-traffic.sh" _supervise "$CONFIG" "$generation" 9>&- >> "$LOG_FILE" 2>&1 &
 }
 
 start() {
@@ -1041,8 +1139,85 @@ start() {
 foreground() {
   ensure_config
   ensure_bin
+  acquire_lock
+  local generation launcher_pid supervisor_pid child_status phase cleanup_deadline
+  if ! run_privileged true; then
+    release_lock
+    return 1
+  fi
+  generation="$(date +%s)-$$"
+  if state_process_ready || runtime_process_active; then
+    echo "already supervised: foreground cannot start another runtime" >&2
+    release_lock
+    return 1
+  fi
+  rm -f "$STOP_FILE"
+  export CORPLINK_NOTIFY_UID="$(notification_uid)"
+  state_write_initial "$generation" "process"
+  append_log_marker "foreground generation=$generation"
   echo "running in foreground; press Ctrl-C to stop"
-  run_privileged env RUST_LOG="$LOG_LEVEL" CORPLINK_RUNTIME_STATE="$STATE_FILE" CORPLINK_RUNTIME_LOG="$LOG_FILE" "$BIN" "$CONFIG"
+  exec 8<&0
+  run_privileged env \
+    CORPLINK_RUN_DIR="$RUN_DIR" \
+    CORPLINK_CONFIG="$CONFIG" \
+    CORPLINK_BIN="$BIN" \
+    CORPLINK_STATE_FILE="$STATE_FILE" \
+    CORPLINK_LOG_FILE="$LOG_FILE" \
+    CORPLINK_RUNTIME_BACKEND="process" \
+    CORPLINK_FOREGROUND="1" \
+    RUST_LOG="$LOG_LEVEL" \
+    "$ROOT/scripts/corplink-traffic.sh" _supervise "$CONFIG" "$generation" <&8 9>&- &
+  launcher_pid=$!
+  exec 8<&-
+  for _ in {1..40}; do
+    supervisor_pid="$(read_supervisor_pid || true)"
+    [[ -n "$supervisor_pid" ]] && break
+    sleep 0.05
+  done
+  if [[ -z "${supervisor_pid:-}" ]]; then
+    phase="$(state_get phase || true)"
+    touch "$STOP_FILE"
+    if process_alive "$launcher_pid"; then
+      (trap - INT TERM; send_term "$launcher_pid" >/dev/null 2>&1 || true) &
+    fi
+    cleanup_deadline=$((SECONDS + STOP_TIMEOUT_SECS))
+    set +e
+    while process_alive "$launcher_pid" && (( SECONDS < cleanup_deadline )); do
+      sleep 0.1
+    done
+    if process_alive "$launcher_pid"; then
+      state_update intent stopping phase stopping ready "<false>" reason "foreground supervisor startup cleanup timed out" || true
+      release_lock
+      return 1
+    fi
+    wait "$launcher_pid" 2>/dev/null || true
+    set -e
+    state_update intent failed phase failed ready "<false>" reason "foreground supervisor did not publish identity (phase=${phase:-unknown})" || true
+    release_lock
+    return 1
+  fi
+  release_lock
+  trap 'touch "$STOP_FILE" 2>/dev/null || true; (trap - INT TERM; send_term "$supervisor_pid" >/dev/null 2>&1 || true) &' INT TERM
+  set +e
+  while process_alive "$launcher_pid"; do
+    sleep 0.1
+  done
+  wait "$launcher_pid" 2>/dev/null
+  child_status=$?
+  set -e
+  trap - INT TERM
+  for _ in {1..50}; do
+    phase="$(state_get phase || true)"
+    [[ "$phase" == "stopped" || "$phase" == "failed" ]] && break
+    sleep 0.1
+  done
+  if [[ "$phase" == "failed" ]]; then
+    return 1
+  fi
+  if [[ "$phase" == "stopped" ]]; then
+    return 0
+  fi
+  return "$child_status"
 }
 
 wait_for_exit() {

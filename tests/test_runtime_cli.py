@@ -5,6 +5,7 @@ import os
 import pathlib
 import json
 import plistlib
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -56,6 +57,232 @@ class RuntimeCliTests(unittest.TestCase):
             self.assertIn("StartLimitBurst=3", unit)
             self.assertNotIn("RestartPreventExitStatus=2", unit)
             self.assertNotIn("RestartPreventExitStatus=101", unit)
+
+    def test_corrupt_runtime_state_fails_once_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            config = run_dir / "config.json"
+            binary = run_dir / "fake-corplink"
+            state = run_dir / "corplink-runtime.json"
+            config.write_text(
+                json.dumps({"company_name": "test", "interface_name": "utun-test"}),
+                encoding="utf-8",
+            )
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            corrupt = b"{ definitely not json\n"
+            state.write_bytes(corrupt)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CORPLINK_RUN_DIR": str(run_dir),
+                    "CORPLINK_CONFIG": str(config),
+                    "CORPLINK_BIN": str(binary),
+                    "CORPLINK_STATE_FILE": str(state),
+                    "CORPLINK_LOG_FILE": str(run_dir / "runtime.log"),
+                    "CORPLINK_RUNTIME_BACKEND": "process",
+                    "CORPLINK_PLATFORM": "Linux",
+                }
+            )
+            result = subprocess.run(
+                [str(SCRIPT), "_supervise", str(config), "corrupt-generation"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                timeout=5,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not parse runtime state", result.stderr.decode())
+            self.assertEqual(state.read_bytes(), corrupt)
+            self.assertFalse((run_dir / "corplink-runtime.json.lock").exists())
+            for _ in range(2):
+                released = subprocess.run(
+                    [str(SCRIPT), "stop"],
+                    cwd=ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(released.returncode, 0, released.stderr)
+    def test_foreground_registers_lifecycle_and_stop_or_sigint_works(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            config = run_dir / "config.json"
+            config.write_text(
+                json.dumps({"company_name": "test", "interface_name": "utun-test"}),
+                encoding="utf-8",
+            )
+            (run_dir / "fake-sudo").write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "os.closerange(3, 256)\n"
+                "os.execvp(sys.argv[1], sys.argv[1:])\n",
+                encoding="utf-8",
+            )
+            (run_dir / "ifconfig").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (run_dir / "ip").write_text(
+                "#!/bin/sh\nprintf '%s\\n' '127.0.0.1 dev utun-test src 127.0.0.1'\n",
+                encoding="utf-8",
+            )
+            (run_dir / "fake-corplink").write_text(
+                """#!/usr/bin/env bash
+set -e
+if [ "$1" = "routes" ] || [ "$1" = "routes-status" ]; then exit 0; fi
+if [ -n "$CORPLINK_RUNTIME_STATE" ] && [ -f "$CORPLINK_RUNTIME_STATE" ]; then
+if IFS= read -r input; then
+printf '%s\\n' "$input" > "$CORPLINK_RUN_DIR/foreground-input.txt"
+fi
+sleep "${FAKE_READY_DELAY:-0}"
+python3 - "$CORPLINK_RUNTIME_STATE" "$CORPLINK_RUNTIME_GENERATION" "$$" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+import time
+path, generation, pid = sys.argv[1:]
+data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+data.update({"phase": "ready", "ready": True, "pid": int(pid), "process_start": subprocess.check_output(["ps", "-p", pid, "-o", "lstart="], text=True).strip(), "handshake_age_secs": 1, "updated_at": str(time.time()), "generation": generation})
+pathlib.Path(path).write_text(json.dumps(data) + "\\n", encoding="utf-8")
+PY
+fi
+trap 'exit 0' TERM INT
+while :; do sleep 0.05; done
+""",
+                encoding="utf-8",
+            )
+            for path in (run_dir / "fake-sudo", run_dir / "fake-corplink", run_dir / "ifconfig", run_dir / "ip"):
+                path.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CORPLINK_RUN_DIR": str(run_dir),
+                    "CORPLINK_CONFIG": str(config),
+                    "CORPLINK_BIN": str(run_dir / "fake-corplink"),
+                    "CORPLINK_PLATFORM": "Linux",
+                    "CORPLINK_MONITOR_BACKEND": "process",
+                    "CORPLINK_SUDO": str(run_dir / "fake-sudo"),
+                    "TEST_HOST": "127.0.0.1",
+                    "FAKE_READY_DELAY": "2",
+                    "PATH": f"{run_dir}{os.pathsep}{os.environ['PATH']}",
+                }
+            )
+            foreground = subprocess.Popen(
+                [str(SCRIPT), "foreground"],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                umask=0o077,
+            )
+            try:
+                foreground.stdin.write("otp-from-pipe\n")
+                foreground.stdin.flush()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        snapshot = json.loads((run_dir / "corplink-runtime.json").read_text(encoding="utf-8"))
+                        if snapshot.get("supervisor_pid") and snapshot.get("phase") in {"connecting", "ready"}:
+                            break
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
+                    time.sleep(0.05)
+                registered = json.loads((run_dir / "corplink-runtime.json").read_text(encoding="utf-8"))
+                self.assertTrue(registered.get("supervisor_pid"))
+                self.assertEqual((run_dir / "corplink-runtime.json").stat().st_mode & 0o777, 0o644)
+                self.assertIn(registered.get("phase"), {"connecting", "ready"})
+                starting_duplicate = subprocess.run([str(SCRIPT), "start"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(starting_duplicate.returncode, 0)
+                self.assertIn("already supervised", starting_duplicate.stderr)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        if json.loads((run_dir / "corplink-runtime.json").read_text(encoding="utf-8")).get("phase") == "ready":
+                            break
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
+                    time.sleep(0.05)
+                self.assertEqual(json.loads((run_dir / "corplink-runtime.json").read_text(encoding="utf-8")).get("phase"), "ready")
+                self.assertEqual((run_dir / "foreground-input.txt").read_text(encoding="utf-8"), "otp-from-pipe\n")
+                status = subprocess.run([str(SCRIPT), "status"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                duplicate = subprocess.run([str(SCRIPT), "start"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+                self.assertIn("already running", duplicate.stdout)
+                os.killpg(foreground.pid, signal.SIGINT)
+                foreground.wait(timeout=10)
+                foreground.communicate(timeout=1)
+                self.assertEqual(foreground.returncode, 0)
+                stopped = subprocess.run([str(SCRIPT), "status"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(stopped.returncode, 0)
+            finally:
+                if foreground.poll() is None:
+                    foreground.terminate()
+                    foreground.wait(timeout=10)
+                foreground.communicate(timeout=1)
+
+
+    def test_dead_operation_lock_is_reclaimed_but_not_a_live_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = pathlib.Path(directory)
+            lock = run_dir / "corplink-traffic.lock"
+            lock.mkdir()
+            (lock / "pid").write_text("999999999\n", encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CORPLINK_RUN_DIR": str(run_dir),
+                    "CORPLINK_CONFIG": str(run_dir / "missing-config.json"),
+                    "CORPLINK_BIN": str(run_dir / "missing-binary"),
+                    "CORPLINK_PLATFORM": "Linux",
+                    "CORPLINK_MONITOR_BACKEND": "process",
+                }
+            )
+            result = subprocess.run(
+                [str(SCRIPT), "stop"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(lock.exists())
+
+            lock.mkdir()
+            (lock / "pid").write_text("999999999\n", encoding="utf-8")
+            contenders = [
+                subprocess.Popen(
+                    [str(SCRIPT), "stop"],
+                    cwd=ROOT,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            results = [process.communicate(timeout=5) for process in contenders]
+            self.assertTrue(all(process.returncode == 0 for process in contenders), results)
+            self.assertFalse(lock.exists())
+
+            lock.mkdir()
+            (lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+            env["CORPLINK_LOCK_TIMEOUT_SECS"] = "0"
+            busy = subprocess.run(
+                [str(SCRIPT), "stop"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+            )
+            self.assertNotEqual(busy.returncode, 0)
+            self.assertTrue(lock.exists())
+
     def test_start_stop_can_repeat_and_tracks_child_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = pathlib.Path(directory)
