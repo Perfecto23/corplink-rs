@@ -631,6 +631,9 @@ send_term() {
 run_supervisor() {
   local config="$1"
   local generation="$2"
+  # The foreground controller translates Ctrl-C into TERM after recording
+  # stop intent. Keep group SIGINT from interrupting the supervisor's helpers.
+  trap '' INT
   if [[ "${CORPLINK_FOREGROUND:-0}" == "1" ]]; then
     # sudo preserves standard input but closes inherited extra descriptors.
     exec 8<&0
