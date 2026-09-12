@@ -93,7 +93,7 @@ data.update({"phase": "ready", "ready": True, "pid": int(pid), "process_start": 
 pathlib.Path(path).write_text(json.dumps(data) + "\\n", encoding="utf-8")
 PY
 if [ -n "${CORPLINK_RUN_DIR:-}" ]; then echo "ready $$" >> "$CORPLINK_RUN_DIR/fake-child.log"; fi
-trap 'exit 0' TERM INT
+trap 'sleep 0.5; exit 0' TERM INT
 while :; do sleep 0.05; done
 """,
                 encoding="utf-8",
@@ -206,7 +206,37 @@ while :; do sleep 0.05; done
                 encoding="utf-8",
             )
             (run_dir / "fake-sudo").write_text(
-                "#!/bin/sh\nif [ \"$1\" = \"-u\" ]; then echo \"$@\" >> \"$CORPLINK_RUN_DIR/sudo-switch.log\"; shift 2; fi\nexec \"$@\"\n",
+                """#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import sys
+
+args = sys.argv[1:]
+root = pathlib.Path(os.environ["CORPLINK_RUN_DIR"])
+if args[0] == "install":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-o")
+    parser.add_argument("-g")
+    parser.add_argument("-m")
+    parser.add_argument("source")
+    parser.add_argument("target")
+    options = parser.parse_args(args[1:])
+    shutil.copyfile(options.source, options.target)
+    pathlib.Path(options.target).chmod(int(options.m, 8))
+    (root / "published-plist.json").write_text(json.dumps({
+        "path": options.target, "owner": options.o, "group": options.g,
+        "mode": int(options.m, 8),
+    }))
+    raise SystemExit(0)
+if args[0] == "-u":
+    with (root / "sudo-switch.log").open("a") as stream:
+        stream.write(" ".join(args) + "\\n")
+    args = args[2:]
+os.execvp(args[0], args)
+""",
                 encoding="utf-8",
             )
             (run_dir / "ifconfig").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -262,26 +292,61 @@ import sys
 import time
 
 command = sys.argv[1]
+registry = pathlib.Path(os.environ["CORPLINK_RUN_DIR"]) / "registered-job.json"
 if command == "asuser":
     subprocess.run(sys.argv[3:], check=False)
+elif command == "print":
+    if not registry.exists():
+        raise SystemExit(113)
+    job = json.loads(registry.read_text())
+    process = subprocess.run(["ps", "-p", str(job["pid"]), "-o", "stat="], capture_output=True, text=True)
+    active = process.returncode == 0 and not process.stdout.strip().startswith("Z")
+    print("state = " + ("running" if active else "not running"))
+    print("program = " + job["arguments"][0])
+    print("arguments = {")
+    for argument in job["arguments"]:
+        print(argument)
+    print("}")
+    if active:
+        print("pid = " + str(job["pid"]))
 elif command == "bootstrap":
+    if registry.exists():
+        raise SystemExit("Bootstrap failed: job is already registered")
     plist = pathlib.Path(sys.argv[3])
+    publication = pathlib.Path(os.environ["CORPLINK_RUN_DIR"]) / "published-plist.json"
+    if not publication.exists():
+        raise SystemExit("system launchd rejected a plist not published with root ownership")
+    published = json.loads(publication.read_text())
+    if published != {"path": str(plist), "owner": "root", "group": "wheel", "mode": 0o644}:
+        raise SystemExit("system launchd rejected plist ownership or permissions")
     data = plistlib.loads(plist.read_bytes())
     env = os.environ.copy()
     env.update(data.get("EnvironmentVariables", {}))
-    subprocess.Popen(data["ProgramArguments"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    child = subprocess.Popen(data["ProgramArguments"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    registry.write_text(json.dumps({"pid": child.pid, "arguments": data["ProgramArguments"]}))
+    # launchd may return after the child has already published readiness.
+    # A root-written PID file is not writable by the foreground user.
+    state_path = pathlib.Path(env["CORPLINK_STATE_FILE"])
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        try:
+            snapshot = json.loads(state_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            snapshot = {}
+        if snapshot.get("phase") in {"ready", "failed"}:
+            pid_path = pathlib.Path(env["CORPLINK_RUN_DIR"]) / "corplink-traffic.pid"
+            if pid_path.exists():
+                pid_path.chmod(0o444)
+            break
+        time.sleep(0.02)
 elif command == "bootout":
     state_path = pathlib.Path(os.environ.get("CORPLINK_STATE_FILE", pathlib.Path(os.environ["CORPLINK_RUN_DIR"]) / "corplink-runtime.json"))
     data = json.loads(state_path.read_text(encoding="utf-8"))
     pid = data.get("supervisor_pid")
     if pid:
         os.kill(pid, signal.SIGTERM)
-        for _ in range(40):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.05)
+        # bootout acknowledges removal before every process has exited.
+    registry.unlink(missing_ok=True)
 else:
     raise SystemExit(2)
 """,
@@ -335,6 +400,7 @@ else:
                 env["CORPLINK_NOTIFY"] = "0"
                 failed_disabled = subprocess.run([str(SCRIPT), "start"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=15)
                 self.assertNotEqual(failed_disabled.returncode, 0)
+                self.assertNotIn("Bootstrap failed", failed_disabled.stderr)
                 self.assertEqual(len((run_dir / "notify-calls.log").read_text(encoding="utf-8").splitlines()), 1)
                 env["CORPLINK_NOTIFY"] = "1"
                 env.pop("CORPLINK_FAKE_ALWAYS_FAIL")

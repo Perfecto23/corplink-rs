@@ -157,6 +157,8 @@ scripts/corplink-traffic.sh start
 - 核对当前进程身份、运行代次和握手；TUN 模式也检查目标路由。
 - 把脱敏状态、退出原因与日志写到 `.run/`，重启时追加日志。
 
+system domain 使用的 plist 会通过 `sudo install` 发布为 `root:wheel`、`0644`。普通用户只写临时草稿；PID 和就绪状态由 supervisor 发布。`launchctl bootout` 返回后，脚本仍会等待实际进程退出，因此不会把异步退出误报成停止失败。服务退出后再次 `start`，会先清理确认属于当前 checkout 和配置、且已停止的 launchd 注册。
+
 `start` 返回 ready 后，后台监护继续工作。暂时故障会有限重试；认证需要人工处理、不可恢复错误或重试耗尽会保留失败状态。macOS 默认对需要处理的后台失败发送本机通知；可以用 `CORPLINK_NOTIFY=0 scripts/corplink-traffic.sh start` 关闭。
 
 如果前台等待超时，命令会说明后台仍在处理，并返回非零。此时用 `status` 查看进度；再次 `start` 会识别已有进程。`stop` 只有确认进程退出后才报告完成；失败时保留身份和诊断，`restart` 不会越过失败的停止步骤。

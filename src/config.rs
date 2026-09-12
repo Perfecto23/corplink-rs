@@ -342,10 +342,15 @@ impl Config {
 
     pub(crate) fn session_identity_tag(&self) -> String {
         let file = self.conf_file.as_deref().unwrap_or_default();
+        // CLI-relative paths and the launcher's absolute path identify the
+        // same configuration, including when a caller uses a symlink alias.
+        let identity_file = std::fs::canonicalize(file)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| file.to_string());
         let platform = self.platform.as_deref().unwrap_or_default();
         let server = self.declared_server.as_deref().unwrap_or_default();
         let material = format!(
-            "{file}\n{}\n{}\n{platform}\n{server}",
+            "{identity_file}\n{}\n{}\n{platform}\n{server}",
             self.company_name, self.username
         );
         let digest = Sha256::digest(material.as_bytes());
@@ -424,6 +429,29 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), source);
         assert!(!crate::state::session_file_path(path.to_str().unwrap(), "corplink").exists());
 
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_and_absolute_config_paths_share_session_identity() {
+        let path = test_config_path("path-identity");
+        let source = br#"{"company_name":"company","username":"user"}"#;
+        fs::write(&path, source).unwrap();
+        let mut relative = PathBuf::new();
+        for _ in std::env::current_dir().unwrap().components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(path.strip_prefix("/").unwrap());
+        let absolute_config = Config::read_only(path.to_str().unwrap()).await.unwrap();
+        let relative_config = Config::read_only(relative.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(
+            absolute_config.session_snapshot().identity,
+            relative_config.session_snapshot().identity
+        );
+        assert_eq!(fs::read(&path).unwrap(), source);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

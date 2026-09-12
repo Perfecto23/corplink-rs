@@ -519,9 +519,14 @@ backend_for() {
 }
 
 write_pid_file() {
-  local pid="$1"
+  local pid="$1" temporary
   mkdir -p "$RUN_DIR"
-  printf '%s\n' "$pid" > "$PID_FILE"
+  temporary="$(mktemp "$RUN_DIR/.corplink-pid.XXXXXX")"
+  if ! printf '%s\n' "$pid" > "$temporary" || ! chmod 0644 "$temporary"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  mv -f "$temporary" "$PID_FILE"
 }
 
 stop_requested() {
@@ -839,10 +844,11 @@ launchd_label() {
 }
 
 write_launchd_plist() {
-  local generation="$1" label plist
+  local generation="$1" label plist staging
   label="$(launchd_label)"
   plist="$RUN_DIR/$label.plist"
-  python3 - "$plist" "$label" "$ROOT/scripts/corplink-traffic.sh" "$CONFIG" "$generation" "$RUN_DIR" "$BIN" "$STATE_FILE" "$LOG_FILE" "$LOG_LEVEL" <<'PY'
+  staging="$(mktemp "$RUN_DIR/.launchd-plist.XXXXXX")"
+  if ! python3 - "$staging" "$label" "$ROOT/scripts/corplink-traffic.sh" "$CONFIG" "$generation" "$RUN_DIR" "$BIN" "$STATE_FILE" "$LOG_FILE" "$LOG_LEVEL" <<'PY'
 import pathlib
 import plistlib
 import os
@@ -878,6 +884,17 @@ data = {
 }
 pathlib.Path(path).write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_XML, sort_keys=False))
 PY
+  then
+    rm -f "$staging"
+    return 1
+  fi
+  # System-domain plists must be root-owned. Keep the user's staging file
+  # separate so subsequent starts can replace an already privileged copy.
+  if ! run_privileged install -o root -g wheel -m 0644 "$staging" "$plist"; then
+    rm -f "$staging"
+    return 1
+  fi
+  rm -f "$staging"
   printf '%s\n' "$plist"
 }
 
@@ -885,18 +902,66 @@ launchctl_cmd() {
   printf '%s\n' "${CORPLINK_LAUNCHCTL:-launchctl}"
 }
 
+retire_inactive_launchd_job() {
+  local ctl target description result
+  ctl="$(launchctl_cmd)"
+  target="$(launchd_domain)/$(launchd_label)"
+  if description="$("$ctl" print "$target" 2>/dev/null)"; then
+    # An exited job remains registered. Only retire this checkout/config's
+    # inactive definition; never unload an active or unrelated job.
+    if ! printf '%s\n' "$description" | python3 -c '
+import pathlib, sys
+program = state = None
+arguments = []
+reading_arguments = False
+for raw in sys.stdin:
+    line = raw.strip()
+    if line.startswith("state = ") and state is None:
+        state = line.split(" = ", 1)[1]
+    if line.startswith("program = ") and program is None:
+        program = line.split(" = ", 1)[1].strip("\"")
+    if line == "arguments = {":
+        reading_arguments = True
+    elif reading_arguments and line == "}":
+        reading_arguments = False
+    elif reading_arguments:
+        arguments.append(line.strip("\""))
+expected_program, expected_config = sys.argv[1:]
+owned = program == expected_program and len(arguments) >= 3
+owned = owned and arguments[0] == expected_program and arguments[1] == "_supervise"
+owned = owned and pathlib.Path(arguments[2]).resolve() == pathlib.Path(expected_config).resolve()
+if not owned or state != "not running":
+    raise SystemExit("existing launchd job is active or belongs to another configuration")
+' "$ROOT/scripts/corplink-traffic.sh" "$CONFIG"; then
+      return 1
+    fi
+    run_privileged "$ctl" bootout "$target"
+  else
+    result=$?
+    if [[ "$result" != "113" ]]; then
+      echo "could not inspect launchd job $target (exit $result)" >&2
+      return 1
+    fi
+  fi
+}
+
 start_launchd() {
   local generation="$1" domain plist ctl
   domain="$(launchd_domain)"
-  plist="$(write_launchd_plist "$generation")"
+  if ! plist="$(write_launchd_plist "$generation")"; then
+    state_update backend launchd phase failed intent failed reason "launchd plist publication failed" || true
+    record_event launchd-plist "privileged publication failed"
+    return 1
+  fi
   ctl="$(launchctl_cmd)"
   if ! run_privileged "$ctl" bootstrap "$domain" "$plist"; then
     state_update backend launchd phase failed intent failed reason "launchd bootstrap failed" || true
     record_event launchd-bootstrap "domain=$domain"
     return 1
   fi
-  write_pid_file ""
-  state_update backend launchd phase starting intent running reason "launchd bootstrap accepted" || true
+  # The supervisor owns PID and readiness publication. It may already be
+  # ready when bootstrap returns, so the caller must not reset its state.
+  record_event launchd-bootstrap "accepted generation=$generation"
   wait_ready
 }
 
@@ -935,6 +1000,11 @@ start() {
     old_supervisor="$(read_supervisor_pid || true)"
     old_child="$(read_child_pid || true)"
     echo "already supervised: supervisor=${old_supervisor:-none} child=${old_child:-none} phase=$(state_get phase || true)" >&2
+    release_lock
+    return 1
+  fi
+
+  if [[ "$backend" == "launchd" ]] && ! retire_inactive_launchd_job; then
     release_lock
     return 1
   fi
@@ -1060,13 +1130,13 @@ stop() {
     fi
   fi
 
-  if [[ -n "$pid" ]] && process_alive "$pid"; then
-    state_update intent stopping phase stopping reason "child still running after stop" || true
+  if [[ -n "$pid" ]] && ! wait_for_exit "$pid"; then
+    state_update intent stopping phase stopping reason "child did not exit before stop deadline" || true
     release_lock
     return 1
   fi
-  if [[ -n "$supervisor" ]] && process_alive "$supervisor"; then
-    state_update intent stopping phase stopping reason "supervisor still running after stop" || true
+  if [[ -n "$supervisor" ]] && ! wait_for_exit "$supervisor"; then
+    state_update intent stopping phase stopping reason "supervisor did not exit before stop deadline" || true
     release_lock
     return 1
   fi
