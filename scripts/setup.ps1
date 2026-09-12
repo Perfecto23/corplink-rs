@@ -1,6 +1,6 @@
 # setup.ps1 — corplink-rs Windows environment setup
-# Automatically downloads wintun.dll to the current directory
-# Usage: powershell -ExecutionPolicy Bypass -File setup.ps1
+# Downloads amd64 wintun.dll beside this script; keep it beside corplink-rs.exe.
+# Usage from a Windows Release bundle: .\setup.ps1
 
 $ErrorActionPreference = "Stop"
 

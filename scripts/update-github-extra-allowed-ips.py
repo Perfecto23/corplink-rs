@@ -7,7 +7,7 @@ import sys
 def main() -> int:
     print(
         "deprecated: forwarding to scripts/update-managed-routes.py; "
-        "managed_routes.github_meta is the single route source",
+        "managed_routes.sources is the single route source",
         file=sys.stderr,
     )
     script = pathlib.Path(__file__).with_name("update-managed-routes.py")

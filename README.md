@@ -1,12 +1,16 @@
-# corplink-rs macOS 使用说明
+# corplink-rs 使用说明
 
-这个仓库用于在 macOS 上启动 `corplink-rs`，并把 GitHub、Redshift 等有 IP 白名单限制的公网目标通过公司 VPN 出口访问。
+`corplink-rs` 是 Rust VPN 客户端，可把 GitHub、Redshift 等有 IP 白名单限制的目标通过公司 VPN 出口访问。本文以 macOS 日常使用为主，Linux 和 Windows 的入口见平台范围一节。
 
 日常只需要维护本机的 `config.local.json`，然后运行：
 
 ```bash
 scripts/corplink-traffic.sh start
 ```
+
+仓库中的维护文档：[项目约定](https://github.com/Perfecto23/corplink-rs/blob/master/AGENTS.md)、[领域术语](https://github.com/Perfecto23/corplink-rs/blob/master/CONTEXT.md)、[可靠性合同](https://github.com/Perfecto23/corplink-rs/blob/master/docs/reliability.md)。这些源文档不随二进制 Release 包分发。
+
+[配置](#3-创建本机配置) · [启动](#4-启动) · [日常命令](#5-日常命令) · [验证访问](#6-验证访问) · [常见问题](#7-常见问题)
 
 ## 1. 准备依赖
 
@@ -41,7 +45,7 @@ brew install rust go python
 把 `<repo-url>` 换成当前 fork 的地址：
 
 ```bash
-git clone <repo-url> corplink-rs
+git clone --recurse-submodules <repo-url> corplink-rs
 cd corplink-rs
 ```
 
@@ -58,10 +62,10 @@ cd ..
 再构建 release binary：
 
 ```bash
-cargo build --release
+cargo build --release --locked
 ```
 
-`scripts/corplink-traffic.sh start` 默认会使用 `target/release/corplink-rs`。如果这个文件不存在，脚本会自动执行 `cargo build --release`。
+脚本优先使用 `CORPLINK_BIN`，否则依次查找 `target/release/corplink-rs`、Release 包根目录的 `corplink-rs`。找不到可执行文件时才自动构建。更新源码后应手动执行 `cargo build --release --locked`；已有 binary 不会因源码变化而自动重建。
 
 macOS/Linux Release 压缩包也包含 `scripts/`。解压后把 `config.json` 复制为 `config.local.json` 并编辑；脚本会识别包根目录的 `corplink-rs`。需要指定其他构建产物时设置 `CORPLINK_BIN`，预检和运行会使用同一份 binary。
 
@@ -134,6 +138,7 @@ cp config.template.json config.local.json
 - `device_id` / `device_name`
 - `public_key` / `private_key`
 - `*_cookies.jsonl`
+- `*_session.json` 及其备份
 - `.run/`
 
 不需要导入浏览器 cookie。程序会自己生成 `*_cookies.jsonl`，它是 `cookie_store` 写出的 JSONL cookie store：一行一条 cookie 记录，不是一个整体 JSON 文档，也不是需要手动编辑的配置文件。
@@ -157,9 +162,9 @@ scripts/corplink-traffic.sh start
 - 核对当前进程身份、运行代次和握手；TUN 模式也检查目标路由。
 - 把脱敏状态、退出原因与日志写到 `.run/`，重启时追加日志。
 
-system domain 使用的 plist 会通过 `sudo install` 发布为 `root:wheel`、`0644`。普通用户只写临时草稿；PID 和就绪状态由 supervisor 发布。`launchctl bootout` 返回后，脚本仍会等待实际进程退出，因此不会把异步退出误报成停止失败。服务退出后再次 `start`，会先清理确认属于当前 checkout 和配置、且已停止的 launchd 注册。
+system domain 使用的 plist 会通过 `sudo install` 发布为 `root:wheel`、`0644`。普通用户只写 plist 临时草稿；supervisor 登记进程身份，Rust 子进程发布握手就绪事实，启动命令等待这些事实。`launchctl bootout` 返回后，脚本仍会等待实际进程退出，因此不会把异步退出误报成停止失败。服务退出后再次 `start`，会先清理确认属于当前 checkout 和配置、且已停止的 launchd 注册。
 
-`start` 返回 ready 后，后台监护继续工作。暂时故障会有限重试；认证需要人工处理、不可恢复错误或重试耗尽会保留失败状态。macOS 默认对需要处理的后台失败发送本机通知；可以用 `CORPLINK_NOTIFY=0 scripts/corplink-traffic.sh start` 关闭。
+`start` 在当前进程完成 WireGuard 握手、TUN 模式的探测目标路由匹配后返回 `ready`，随后后台监护继续工作。暂时故障会有限重试；本地资源清理失败、认证需要人工处理、不可恢复错误或重试耗尽会保留失败状态。macOS 默认对需要处理的后台失败发送本机通知；可以用 `CORPLINK_NOTIFY=0 scripts/corplink-traffic.sh start` 关闭后台通知。
 
 如果前台等待超时，命令会说明后台仍在处理，并返回非零。此时用 `status` 查看进度；再次 `start` 会识别已有进程。`stop` 只有确认进程退出后才报告完成；失败时保留身份和诊断，`restart` 不会越过失败的停止步骤。
 
@@ -170,6 +175,8 @@ scripts/corplink-traffic.sh foreground
 ```
 
 前台会话也登记运行身份和状态，可从另一终端执行 `status` 或 `stop`。已有前台会话时，`start` 不会重复启动；按 Ctrl-C 会等待清理完成后退出。
+
+前台退出后需要继续后台使用时，再执行 `scripts/corplink-traffic.sh start`。这两种方式管理的是同一个运行位置中的会话。
 
 ## 5. 日常命令
 
@@ -183,13 +190,28 @@ scripts/corplink-traffic.sh stop        # 停止当前 VPN 会话
 
 `status` 仅在当前进程身份和健康观测有效时返回 0；停止、失效或观测过期时返回非零。它不再通过重新访问远端来猜测已应用路由；实时目标访问用 `test-host` 检查。
 
+常用环境变量：
+
+| 变量 | 作用 |
+| --- | --- |
+| `CORPLINK_CONFIG` | 指定配置文件，默认仓库或 Release 包根目录的 `config.local.json` |
+| `CORPLINK_BIN` | 指定运行与预检使用的同一份可执行文件 |
+| `CORPLINK_RUN_DIR` | 指定监护状态与日志目录，默认根目录的 `.run/`；不改变配置中的 managed routes cache 路径 |
+| `CORPLINK_NOTIFY=0` | 启动时关闭 macOS 后台失败通知 |
+| `TEST_HOST` / `TEST_PORT` | 覆盖探测目标与可选 TCP 端口，不修改 VPN 路由配置 |
+| `TEST_REPO` | `test` 使用的 Git 仓库地址 |
+
+对同一会话执行 `start`、`foreground`、`status`、`stop` 时，应使用同一组配置、binary 和运行目录。这些路径型环境变量中的相对路径按调用时的工作目录解析。同一个 TUN 接口不要并行启动多份配置。
+
+`scripts/corplink-github.sh` 是兼容入口，转发到同一套命令并把默认 `TEST_HOST` 设为 `github.com`。
+
 只检查 managed routes 解析结果：
 
 ```bash
 scripts/update-managed-routes.py config.local.json --dry-run
 ```
 
-`--dry-run` 只打印解析结果，不写 `.run/managed-routes-cache.json`；需要预先刷新 cache 时显式加 `--write-cache`。
+`--dry-run` 只打印解析结果，不写 cache；需要预先刷新时将它换成 `--write-cache`，两个参数不能同时使用。默认 cache 为配置文件目录下的 `.run/managed-routes-cache.json`，可由 `managed_routes.cache_file` 覆盖。
 
 Rust 也提供相同入口：
 
@@ -201,12 +223,20 @@ target/release/corplink-rs routes-status config.local.json
 
 预检不会登录、提权、生成 key 或写认证 sidecar。结果区分 `fresh` 和 `cache`。`routes-status` 返回 `last_applied` 历史记录，其中系统路由与 AllowedIPs 分列；是否仍在运行还须看当前运行状态。Netstack 模式不安装系统路由。
 
+旧的 `scripts/update-github-extra-allowed-ips.py` 也转发到这个入口，不再写回 `extra_allowed_ips`。
+
 ## 6. 验证访问
 
 检查默认目标路由：
 
 ```bash
 scripts/corplink-traffic.sh test-host
+```
+
+默认优先检查 GitHub source，否则检查首个 `dns_hosts` host。只运行 `test-host` 是路由检查；要验证 TCP 连通性需提供 `TEST_PORT`，例如：
+
+```bash
+TEST_HOST=github.com TEST_PORT=443 scripts/corplink-traffic.sh test-host
 ```
 
 测试 Redshift 端口。`dns_hosts` source 已经配置 `port: 5439` 时，不需要再写 host：
@@ -221,7 +251,7 @@ TEST_PORT=5439 scripts/corplink-traffic.sh test-host
 TEST_REPO=git@github.com:owner/repo.git scripts/corplink-traffic.sh test
 ```
 
-`TEST_HOST` 不是配置项，只是临时排查用的覆盖值。只有当你想临时检查一个没有写进 `managed_routes` 的目标时才需要它：
+`TEST_PORT` 会优先选择 `port` 相同的 `dns_hosts` source。source 的 `port` 是选择探测目标的提示，不是端口转发或防火墙规则；显式 `TEST_HOST` 的优先级最高：
 
 ```bash
 TEST_HOST=other.example.com TEST_PORT=443 scripts/corplink-traffic.sh test-host
@@ -229,16 +259,29 @@ TEST_HOST=other.example.com TEST_PORT=443 scripts/corplink-traffic.sh test-host
 
 ## 7. 常见问题
 
-如果 `start` 失败，先看日志：
-
-```bash
-scripts/corplink-traffic.sh logs -f
-```
-
-如果路由没有走 VPN，检查当前目标解析到了哪些 IP、走哪个接口：
+如果 `start` 失败，先查看状态和日志：
 
 ```bash
 scripts/corplink-traffic.sh status
+scripts/corplink-traffic.sh logs -f
+```
+
+按结果处理：
+
+| 结果 | 下一步 |
+| --- | --- |
+| `already running` | 已有就绪实例，可直接使用；重复 `start` 不会重建连接 |
+| `already supervised` 或前台等待超时 | 后台仍可能连接中，先看 `status` 和日志 |
+| 需要认证或交互 | 当前会话结束后运行 `foreground` 完成登录 |
+| 清理失败或停止超时 | 保留状态与日志，先处理具体失败；`restart` 不会越过失败的 `stop` |
+| 状态 JSON 损坏 | 保留原文件排查；监护不会通过反复解析来掩盖损坏 |
+
+操作锁文件在会话结束后仍可存在，它不代表进程存活。旧目录锁会在核实原进程已退出后回收，无需手动删除 `.run/` 或 PID 文件。
+
+如果路由没有走 VPN，用 `test-host` 检查当前目标解析到的 IP 和接口：
+
+```bash
+TEST_HOST=github.com scripts/corplink-traffic.sh test-host
 ```
 
 如果改了 Redshift endpoint 或 GitHub source，重启进程刷新 managed routes：
@@ -255,9 +298,18 @@ scripts/corplink-traffic.sh restart
 
 启用 `use_vpn_dns` 时，macOS 会在修改任何 DNS 前把原设置写入 `/var/run/corplink-rs/dns-backup.json`。成功恢复后才删除快照；异常退出后的下一次连接先处理遗留快照。快照损坏、归属不明或仍属于另一活实例时会拒绝覆盖，需保留文件排查。`dns_backup_filename` 可指定其他位置；macOS 相对路径以配置文件目录为准。
 
-Linux 继续使用 `/etc/resolv.conf` 旁的备份；备份失败不会覆盖 resolver，恢复失败保留证据。`systemd/` 样例由程序处理正常连接重试，systemd 负责有上限的异常进程重启。macOS 日常入口使用 launchd；Windows 保留原有 binary/setup 入口，本机通知功能仅在 macOS 提供。
+Linux 使用 `/etc/resolv.conf` 旁的备份；备份失败不会覆盖 resolver，恢复失败保留证据。持续后台运行可使用 [systemd 样例](https://github.com/Perfecto23/corplink-rs/blob/master/systemd/corplink-rs.service)：binary 位于 `/usr/bin/corplink-rs`，配置位于 `/etc/corplink/config.json`，实例化样例读取 `/etc/corplink/<实例名>.json`。程序负责连接恢复，systemd 对异常退出限次重启，应用已处理的失败退出码 `1` 不自动重启。Shell 的 Linux 后台模式只有进程 supervisor，不等同于 systemd 服务安装。
 
-当前仍保留原有自签名证书兼容策略，不验证服务端证书链；本轮没有静默切换企业证书信任配置。
+Windows Release 包中的 `setup.ps1` 下载 amd64 `wintun.dll` 到脚本所在目录；在解压后的包目录运行它，使 DLL 与 `corplink-rs.exe` 同目录，再从管理员终端启动：
+
+```powershell
+.\setup.ps1
+.\corplink-rs.exe config.json
+```
+
+源码树中的安装脚本位于 `scripts/setup.ps1`，输出 DLL 也会放在 `scripts/`，需另行放到 executable 旁。Windows 使用原生 binary，不使用 macOS 的 launchd 或 Shell 状态监护。本机失败通知仅在 macOS 提供。
+
+企业网关连接保留自签名证书兼容策略，客户端接受无效服务端证书；使用前应确认企业环境的信任要求。
 
 ## 9. 开发验证
 
@@ -271,3 +323,16 @@ cargo build --release --locked
 ```
 
 自动化测试使用回环网关、临时文件和受控操作系统命令。Go FFI probe 只创建用户态 netstack 和回环监听器，不创建系统 TUN 或连接真实 VPN。真实安装、断网/休眠恢复及各平台验证需要单独验收。
+
+Windows 构建入口与 CI 一致：
+
+```powershell
+cd libwg
+.\build.ps1 --test
+cd ..
+cargo build --release --locked
+```
+
+两个构建脚本都在应用补丁后的临时源码目录运行 Go 测试和构建。当前 [CI 定义](https://github.com/Perfecto23/corplink-rs/blob/master/.github/workflows/test.yml) 在 macOS/Linux 执行 Rust 与 CLI 测试，在 Windows 执行 PowerShell/Go 测试与 release 构建。
+
+源码 `59e2000` 的本地验收覆盖了 macOS 前后台启动、跨终端停止、Ctrl-C、重复启动互斥、真实 sudo 和严格 `umask` 下的状态读取；PowerShell 入口已在 macOS 临时环境实跑。原生 Linux/Windows、休眠或真实断网恢复、桌面通知展示仍需对应环境验收，不能由 CI 配置或本机单元测试推定通过。

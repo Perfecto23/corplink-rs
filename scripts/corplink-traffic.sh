@@ -62,11 +62,11 @@ usage() {
 Usage: scripts/corplink-traffic.sh <command>
 
 Commands:
-  start       Start corplink-rs in the background
-  foreground  Run corplink-rs in the foreground
-  stop        Stop the background corplink-rs process
+  start       Start a supervised background session and wait for readiness
+  foreground  Run an interactive session managed by the same status/stop commands
+  stop        Stop the current managed session, whether foreground or background
   restart     Stop, then start
-  status      Show process, interface, route, and managed source status
+  status      Show runtime health and last-applied routes; nonzero when not ready
   preflight   Resolve managed_routes without printing config secrets
   test        Test GitHub repo access; requires TEST_REPO
   test-host   Test the inferred route target and optional TEST_PORT TCP connectivity

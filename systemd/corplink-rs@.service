@@ -1,6 +1,6 @@
 [Unit]
 Description=Corplink client written in Rust
-Documentation=https://github.com/PinkD/corplink-rs
+Documentation=https://github.com/Perfecto23/corplink-rs
 StartLimitIntervalSec=300s
 StartLimitBurst=3
 After=network.target
