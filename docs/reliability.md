@@ -77,7 +77,7 @@ cargo build --release --locked
 
 Go C ABI probe 隔离子进程，验证无设备查询、占用端口失败回滚、SOCKS greeting、端口释放和重复启动。它只使用用户态 netstack、回环监听器和临时文件，不配置 peer 或系统 TUN。Rust/CLI 测试使用回环网关和受控 OS adapter。
 
-TCP 传输的连续包测试位于补丁中的 `conn/bind_tcp_burst_test.go`，通过真实回环 TCP 验证包内容不被后续读取覆盖。接收缓冲区在消费方复制完成后归还池；`--test` 同时运行 `conn` 包。API 响应体中断归类为可恢复传输错误；VPN 协商请求使用 30 秒上限，普通 API 保持原有 10 秒上限。
+TCP 传输的连续包测试位于补丁中的 `conn/bind_tcp_burst_test.go`，通过真实回环 TCP 验证包内容不被后续读取覆盖。接收缓冲区在消费方复制完成后归还池；发送端串行写入完整帧，避免握手与数据并发发送时帧头、包体交错。`conn/bind_tcp_concurrent_test.go` 使用真实回环 TCP 验证并发帧完整性；`--test` 同时运行 `conn` 包。API 响应体中断归类为可恢复传输错误；VPN 协商请求使用 30 秒上限，普通 API 保持原有 10 秒上限。
 
 关键回归入口：
 

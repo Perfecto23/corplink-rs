@@ -1,0 +1,127 @@
+diff --git a/conn/bind_tcp.go b/conn/bind_tcp.go
+--- a/conn/bind_tcp.go
++++ b/conn/bind_tcp.go
+@@ -31,7 +31,8 @@
+ }
+ 
+ type TcpBind struct {
+-	// TODO: do we need mutex?
++	// Serialize frame headers and payloads, including concurrent handshake sends.
++	sendMu     sync.Mutex
+ 	tcpConnMap common.SyncMap[string, *net.TCPConn]
+ 	listener   *net.TCPListener
+ 
+@@ -197,6 +198,9 @@
+ }
+ 
+ func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) error {
++	t.sendMu.Lock()
++	defer t.sendMu.Unlock()
++
+ 	conn, err := t.getConn(endpoint)
+ 	if err != nil {
+ 		return err
+diff --git a/conn/bind_tcp_concurrent_test.go b/conn/bind_tcp_concurrent_test.go
+new file mode 100644
+--- /dev/null
++++ b/conn/bind_tcp_concurrent_test.go
+@@ -0,0 +1,99 @@
++package conn
++
++import (
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"net"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestTCPBindSerializesConcurrentFrames(t *testing.T) {
++	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	server, err := listener.AcceptTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	client.SetDeadline(time.Now().Add(8 * time.Second))
++	server.SetDeadline(time.Now().Add(8 * time.Second))
++	bind := NewTCPBind().(*TcpBind)
++	endpoint, err := bind.ParseEndpoint(listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Preinstall one connection to isolate framing from concurrent dial creation.
++	bind.tcpConnMap.Store(endpoint.DstToString(), client)
++	const writers = 32
++	const frames = 100
++	const size = 4096
++	readDone := make(chan error, 1)
++	go func() {
++		for i := 0; i < writers*frames; i++ {
++			var header [4]byte
++			if _, e := io.ReadFull(server, header[:]); e != nil {
++				readDone <- e
++				return
++			}
++			n := binary.LittleEndian.Uint32(header[:])
++			if n != size {
++				readDone <- fmt.Errorf("frame %d: expected length %d, got %d (header %x)", i, size, n, header)
++				return
++			}
++			payload := make([]byte, n)
++			if _, e := io.ReadFull(server, payload); e != nil {
++				readDone <- e
++				return
++			}
++			if payload[0] < 0x40 || payload[0] >= 0x40+writers || !bytes.Equal(payload, bytes.Repeat(payload[:1], size)) {
++				readDone <- fmt.Errorf("frame %d: payload corrupted, first 20 bytes %x", i, payload[:20])
++				return
++			}
++		}
++		readDone <- nil
++	}()
++	sendErrors := make(chan error, writers)
++	var wg sync.WaitGroup
++	start := make(chan struct{})
++	for w := 0; w < writers; w++ {
++		wg.Add(1)
++		go func(id int) {
++			defer wg.Done()
++			<-start
++			data := bytes.Repeat([]byte{byte(0x40 + id)}, size)
++			for i := 0; i < frames; i++ {
++				if err := bind.Send([][]byte{data}, endpoint); err != nil {
++					sendErrors <- err
++					return
++				}
++			}
++		}(w)
++	}
++	close(start)
++	result := <-readDone
++	// Unblock senders immediately even when the receiver catches a corrupt frame.
++	if result != nil {
++		client.Close()
++		server.Close()
++	}
++	wg.Wait()
++	close(sendErrors)
++	for err := range sendErrors {
++		t.Errorf("send failed: %v", err)
++	}
++	if result != nil {
++		t.Fatal(result)
++	}
++}
