@@ -173,6 +173,8 @@ pub fn classify_error(error: &anyhow::Error) -> FailureKind {
         .unwrap_or(FailureKind::Protocol)
 }
 
+pub(crate) const CORPLINK_APP_VERSION: &str = "201000";
+
 const URL_GET_LOGIN_METHOD: &str = "{{url}}/api/login/setting?os={{os}}&os_version={{version}}";
 const URL_GET_TPS_LOGIN_METHOD: &str = "{{url}}/api/tpslogin/link?os={{os}}&os_version={{version}}";
 const URL_GET_TPS_TOKEN_CHECK: &str =
@@ -183,7 +185,8 @@ const URL_VERIFY_CODE: &str = "{{url}}/api/login/code/verify?os={{os}}&os_versio
 const URL_LOGIN_PASSWORD: &str = "{{url}}/api/login?os={{os}}&os_version={{version}}";
 const URL_LOGIN_PASSWORD_V1: &str =
     "{{url}}/api/v1/login?os={{os}}&os_version={{version}}&client_source=FeiLian";
-const URL_LIST_VPN: &str = "{{url}}/api/vpn/list?os={{os}}&os_version={{version}}";
+const URL_LIST_VPN: &str =
+    "{{url}}/api/vpn/list?os={{os}}&os_version={{version}}&app_version={{app_version}}";
 
 const URL_PING_VPN_HOST: &str = "{{url}}/vpn/ping?os={{os}}&os_version={{version}}";
 const URL_FETCH_PEER_INFO: &str = "{{url}}/vpn/conn?os={{os}}&os_version={{version}}";
@@ -237,6 +240,7 @@ impl ApiName {
 
 #[derive(Clone, Serialize)]
 struct UserUrlParam {
+    app_version: String,
     url: String,
     os: String,
     version: String,
@@ -292,6 +296,7 @@ impl ApiUrl {
 
         Ok(ApiUrl {
             user_param: UserUrlParam {
+                app_version: CORPLINK_APP_VERSION.to_string(),
                 url: conf
                     .server
                     .clone()

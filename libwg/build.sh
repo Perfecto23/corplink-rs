@@ -7,7 +7,7 @@ usage: libwg/build.sh [--test]
 
 Build the patched wireguard-go archive without changing the checked-out
 submodule. CORPLINK_WG_SOURCE may point at another local Git checkout.
-With --test, go test ./libwg ./corplink runs in the same patched copy.
+With --test, go test ./libwg ./corplink ./conn runs in the same patched copy.
 EOF
 }
 
@@ -92,7 +92,7 @@ if [[ "$patch_count" -gt 0 ]]; then
 fi
 
 if ((run_tests)); then
-    (cd "$patched_root" && go test ./libwg ./corplink)
+    (cd "$patched_root" && go test ./libwg ./corplink ./conn)
     host_os=$(uname -s)
     if [[ "$host_os" == "Darwin" || "$host_os" == "Linux" ]]; then
         command -v python3 >/dev/null 2>&1 || {

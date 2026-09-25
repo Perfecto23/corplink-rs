@@ -296,6 +296,33 @@ scripts/corplink-traffic.sh restart
 
 ## 8. DNS 恢复与平台范围
 
+### 与 Surge 增强模式共存
+
+需要同时使用 Surge 与公司 VPN 时，可将 Corplink 作为本机 SOCKS 上游，由 Surge 按公司域名分流：
+
+```json
+{
+  "socks5_listen": "127.0.0.1:1088",
+  "route_mode": "full"
+}
+```
+
+此处 `full` 仅作用于用户态隧道，不替换系统默认路由；只有交给该 SOCKS 入口的请求经过 VPN。监听地址保持 loopback。Surge 的策略和规则示例：
+
+```ini
+[Proxy]
+Corplink = socks5, 127.0.0.1, 1088
+
+[Rule]
+# 公司域名规则应位于通用代理规则之前。
+DOMAIN-SUFFIX,github.com,Corplink
+DOMAIN-SUFFIX,company.example.com,Corplink
+```
+
+按实际需要补充公司域名和数据库 endpoint；VPN 节点的外层连接应单独直连，不能再次送入 Corplink。普通 `DIRECT` 不等于“经过公司 VPN”，验收必须包含 Surge 开启时的公司资源请求和普通上网请求。调整节点、TCP/UDP 或分流后，握手成功仍不能替代 HTTP/数据库访问验证。
+
+### 平台行为
+
 启用 `use_vpn_dns` 时，macOS 会在修改任何 DNS 前把原设置写入 `/var/run/corplink-rs/dns-backup.json`。成功恢复后才删除快照；异常退出后的下一次连接先处理遗留快照。快照损坏、归属不明或仍属于另一活实例时会拒绝覆盖，需保留文件排查。`dns_backup_filename` 可指定其他位置；macOS 相对路径以配置文件目录为准。
 
 Linux 使用 `/etc/resolv.conf` 旁的备份；备份失败不会覆盖 resolver，恢复失败保留证据。持续后台运行可使用 [systemd 样例](https://github.com/Perfecto23/corplink-rs/blob/master/systemd/corplink-rs.service)：binary 位于 `/usr/bin/corplink-rs`，配置位于 `/etc/corplink/config.json`，实例化样例读取 `/etc/corplink/<实例名>.json`。程序负责连接恢复，systemd 对异常退出限次重启，应用已处理的失败退出码 `1` 不自动重启。Shell 的 Linux 后台模式只有进程 supervisor，不等同于 systemd 服务安装。

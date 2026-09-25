@@ -31,6 +31,12 @@ CLI 的 `ready` 是当前子进程的握手与身份观测，`start` 还对 TUN 
 
 systemd 使用 `on-failure` 并排除应用已处理失败的退出码 `1`，配合 `RestartSec=5s`、300 秒内最多 3 次启动限制。CLI 的 macOS 后台模式由 launchd 管理 supervisor，已处理终态由 supervisor 正常退出以结束外层恢复。Shell 的 Linux `process` 模式不提供 supervisor 自身的 OS 重启保障；持续运行需使用 systemd。参见 [systemd 的 Restart 合同](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)。
 
+## 上游稳定性修复
+
+本 fork 移植了 [上游 #97 / 90370cf](https://github.com/PinkD/corplink-rs/commit/90370cf07b414184e2c0ae285f2b75865a861165) 的节点发现、并发探测、Cookie 隔离与 IPv6 处理。默认策略仍按服务端列表优先级选节点；探测响应不会修改共享认证状态，只有最终选中节点的 Cookie 会用于协商和持久化。所有候选失败时保留错误分类，由既有恢复策略处理传输失败、服务端错误和认证失效；探测错误不输出响应体。
+
+服务端未分配 IPv6 隧道地址时忽略其 IPv6 路由；VPN 列表请求携带与 User-Agent 一致的 app version。`managed_routes`、`extra_allowed_ips`、认证 sidecar、有限重连和本地 Go 传输补丁继续使用本 fork 的实现。本次未引入上游的额外路由配置字段，也未同步其依赖锁文件或发行版本号。
+
 ## 配置与恢复数据
 
 用户配置只读加载；运行中生成的认证数据写入配置旁的私密 sidecar。Cookie 按配置身份隔离，保留原 JSONL 格式。迁移可中断后恢复，损坏内容在恢复写入前保留，原子写失败不破坏旧文件。
@@ -70,6 +76,8 @@ cargo build --release --locked
 ```
 
 Go C ABI probe 隔离子进程，验证无设备查询、占用端口失败回滚、SOCKS greeting、端口释放和重复启动。它只使用用户态 netstack、回环监听器和临时文件，不配置 peer 或系统 TUN。Rust/CLI 测试使用回环网关和受控 OS adapter。
+
+TCP 传输的连续包测试位于补丁中的 `conn/bind_tcp_burst_test.go`，通过真实回环 TCP 验证包内容不被后续读取覆盖。接收缓冲区在消费方复制完成后归还池；`--test` 同时运行 `conn` 包。API 响应体中断归类为可恢复传输错误；VPN 协商请求使用 30 秒上限，普通 API 保持原有 10 秒上限。
 
 关键回归入口：
 
