@@ -868,8 +868,10 @@ impl Client {
             match result {
                 Ok(response) => {
                     log::info!(
-                        "server name {}, latency {}ms",
-                        vpn.en_name,
+                        "server name {}, endpoint {}:{}, latency {}ms",
+                        vpn.display_name(),
+                        vpn.ip,
+                        vpn.api_port,
                         response.latency_ms
                     );
                     let should_replace = match &fastest {
@@ -932,8 +934,10 @@ impl Client {
                 match result {
                     Ok(response) => {
                         log::info!(
-                            "server name {}, latency {}ms",
-                            vpn.en_name,
+                            "server name {}, endpoint {}:{}, latency {}ms",
+                            vpn.display_name(),
+                            vpn.ip,
+                            vpn.api_port,
                             response.latency_ms
                         );
                         return Ok(SelectedVpn {
@@ -1131,19 +1135,21 @@ impl Client {
             vpn_info.len(),
             vpn_info
                 .iter()
-                .map(|i| i.en_name.clone())
-                .collect::<Vec<String>>()
+                .map(RespVpnInfo::display_name)
+                .collect::<Vec<_>>()
         );
         let filtered_vpn = vpn_info
             .into_iter()
             .filter(|vpn| {
-                if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
-                        return false;
-                    }
+                let matches = vpn.matches_name(self.conf.vpn_server_name.as_deref());
+                if !matches {
+                    log::info!(
+                        "skip {}, expect {:?}",
+                        vpn.display_name(),
+                        self.conf.vpn_server_name
+                    );
                 }
-                true
+                matches
             })
             .filter(|vpn| {
                 let mode = match vpn.protocol_mode {
@@ -1157,7 +1163,7 @@ impl Client {
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
-                            vpn.en_name,
+                            vpn.display_name(),
                             mode
                         );
                         false
@@ -1196,7 +1202,11 @@ impl Client {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
             Err(_) => format!("{}:{}", vpn.ip, vpn.vpn_port),
         };
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        log::info!(
+            "try connect to {}, address {}",
+            vpn.display_name(),
+            vpn_addr
+        );
 
         let key = self
             .conf
@@ -1984,7 +1994,7 @@ mod tests {
         let b_seen = Arc::new(Mutex::new(Vec::new()));
         let list_seen = Arc::new(Mutex::new(Vec::new()));
         let list_body = format!(
-            "{{\"code\":0,\"data\":[{{\"api_port\":{a_port},\"vpn_port\":51820,\"ip\":\"127.0.0.1\",\"protocol_mode\":2,\"name\":\"a\",\"en_name\":\"A\",\"icon\":\"\",\"id\":1,\"timeout\":10}},{{\"api_port\":{b_port},\"vpn_port\":51821,\"ip\":\"127.0.0.1\",\"protocol_mode\":2,\"name\":\"b\",\"en_name\":\"B\",\"icon\":\"\",\"id\":2,\"timeout\":10}}]}}"
+            "{{\"code\":0,\"data\":[{{\"api_port\":{a_port},\"vpn_port\":51820,\"ip\":\"127.0.0.1\",\"protocol_mode\":2,\"name\":\"Cloud VPN\",\"en_name\":\"\",\"icon\":\"\",\"id\":1,\"timeout\":10}},{{\"api_port\":{b_port},\"vpn_port\":51821,\"ip\":\"127.0.0.1\",\"protocol_mode\":2,\"name\":\"Cloud VPN\",\"en_name\":\"\",\"icon\":\"\",\"id\":2,\"timeout\":10}}]}}"
         );
         let conn_body = r#"{"code":0,"data":{"ip":"10.0.0.2","ipv6":"","ip_mask":"24","public_key":"peer-key","setting":{"vpn_mtu":1420,"vpn_dns":"10.0.0.53","vpn_dns_backup":"","vpn_dns_domain_split":null,"vpn_route_full":[],"vpn_route_split":["10.0.0.0/8"],"v6_route_full":null,"v6_route_split":["2001:db8::/32"]},"mode":0}}"#;
         let list_thread = serve(
@@ -2015,7 +2025,7 @@ mod tests {
         let config_path = dir.join("config.json");
         let server = format!("http://127.0.0.1:{list_port}");
         let source = format!(
-            "{{\"company_name\":\"company\",\"username\":\"user\",\"platform\":\"lark\",\"server\":\"{server}\",\"vpn_select_strategy\":\"latency\"}}"
+            "{{\"company_name\":\"company\",\"username\":\"user\",\"platform\":\"lark\",\"server\":\"{server}\",\"vpn_select_strategy\":\"latency\",\"vpn_server_name\":\"Cloud VPN\"}}"
         );
         fs::write(&config_path, source).unwrap();
         let mut config = Config::from_file(config_path.to_str().unwrap())

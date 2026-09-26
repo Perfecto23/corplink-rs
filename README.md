@@ -123,6 +123,22 @@ cp config.template.json config.local.json
 - `interface_name`：本机 TUN 网卡名，默认可以先用 `utun12345`。
 - `managed_routes.sources`：需要走 VPN 出口的公网目标。模板默认包含 GitHub 和 Redshift。
 
+节点选择由两个字段控制：
+
+- `vpn_server_name`：按飞连显示名称或英文名称精确匹配；省略、`null`、空字符串或纯空格表示不限定节点组。
+- `vpn_select_strategy: "latency"`：在匹配的端点中选择 API 探测延迟最低的端点；`"default"` 或省略时按服务端列表顺序选择可用端点。这里的延迟不是业务请求耗时。
+
+例如固定 Cloud VPN，并在该组的多个端点间自动选低延迟节点：
+
+```json
+{
+  "vpn_server_name": "Cloud VPN",
+  "vpn_select_strategy": "latency"
+}
+```
+
+要在全部节点组间自动选择，删除 `vpn_server_name` 并保留 `latency`；要固定其他组，将名称改成飞连界面的实际名称。默认遵循节点声明的 TCP/UDP 协议，只有需要显式覆盖时才设置 `force_protocol: "tcp"` 或 `"udp"`。更改配置后运行 `scripts/corplink-traffic.sh restart` 生效。
+
 `platform` 和 `password` 的关系：
 
 - `platform: "feilian"`：`password` 可以填真实密码；客户端会在登录前自动转成 sha256。也支持直接填 64 位 sha256 hex。

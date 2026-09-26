@@ -67,14 +67,30 @@ pub struct RespVpnInfo {
     pub api_port: u16,
     pub vpn_port: u16,
     pub ip: String,
-    // 1 for tcp, 2 for udp, we only support udp for now
+    // 1 for TCP, 2 for UDP.
     pub protocol_mode: i32,
-    // useless
     pub name: String,
     pub en_name: String,
     pub icon: String,
     pub id: i32,
     pub timeout: i32,
+}
+
+impl RespVpnInfo {
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.en_name
+        } else {
+            &self.name
+        }
+    }
+
+    pub fn matches_name(&self, configured: Option<&str>) -> bool {
+        match configured.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => self.name == name || self.en_name == name,
+            None => true,
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -97,4 +113,36 @@ pub struct RespWgInfo {
     pub public_key: String,
     pub setting: RespWgExtraInfo,
     pub mode: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RespVpnInfo;
+
+    #[test]
+    fn node_names_match_display_or_english_name_and_blank_means_automatic() {
+        for (name, en_name) in [("Office", ""), ("云节点", "Cloud VPN"), ("", "Cloud VPN")] {
+            let vpn: RespVpnInfo = serde_json::from_value(serde_json::json!({
+                "api_port": 443, "vpn_port": 51820, "ip": "127.0.0.1",
+                "protocol_mode": 2, "name": name, "en_name": en_name,
+                "icon": "", "id": 1, "timeout": 10
+            }))
+            .unwrap();
+            for automatic in [None, Some(""), Some("  ")] {
+                assert!(vpn.matches_name(automatic));
+            }
+            for alias in [name, en_name]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+            {
+                assert!(vpn.matches_name(Some(alias)));
+                assert!(vpn.matches_name(Some(&format!(" {alias} "))));
+            }
+            assert!(!vpn.matches_name(Some("unavailable node")));
+            assert_eq!(
+                vpn.display_name(),
+                if name.is_empty() { en_name } else { name }
+            );
+        }
+    }
 }
