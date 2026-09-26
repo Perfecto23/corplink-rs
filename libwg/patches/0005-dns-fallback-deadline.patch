@@ -1,0 +1,104 @@
+diff --git a/tun/netstack/tun.go b/tun/netstack/tun.go
+--- a/tun/netstack/tun.go
++++ b/tun/netstack/tun.go
+@@ -757,8 +757,16 @@
+ 	}
+ 
+ 	for i := 0; i < 2; i++ {
+-		for _, server := range tnet.dnsServers {
+-			p, h, err := tnet.exchange(ctx, server, q, time.Second*5)
++		for index, server := range tnet.dnsServers {
++			timeout := 5 * time.Second
++			if deadline, ok := ctx.Deadline(); ok {
++				// A silent primary must leave time for the remaining resolvers.
++				remaining := time.Until(deadline) / time.Duration(len(tnet.dnsServers)-index)
++				if remaining < timeout {
++					timeout = remaining
++				}
++			}
++			p, h, err := tnet.exchange(ctx, server, q, timeout)
+ 			if err != nil {
+ 				dnsErr := &net.DNSError{
+ 					Err:    err.Error(),
+diff --git a/tun/netstack/dns_deadline_test.go b/tun/netstack/dns_deadline_test.go
+new file mode 100644
+--- /dev/null
++++ b/tun/netstack/dns_deadline_test.go
+@@ -0,0 +1,77 @@
++package netstack
++
++import (
++	"context"
++	"golang.org/x/net/dns/dnsmessage"
++	"net/netip"
++	"testing"
++	"time"
++)
++
++func TestDNSDeadlineLeavesTimeForBackup(t *testing.T) {
++	for _, backupResponds := range []bool{true, false} {
++		name := "all-blackholes"
++		if backupResponds {
++			name = "primary-blackhole-backup-healthy"
++		}
++		t.Run(name, func(t *testing.T) {
++			ips := []netip.Addr{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")}
++			dev, stack, err := CreateNetTUN(ips, ips, 1420)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer dev.Close()
++			for index, ip := range ips {
++				listener, err := stack.ListenUDPAddrPort(netip.AddrPortFrom(ip, 53))
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer listener.Close()
++				responds := index == 1 && backupResponds
++				go func() {
++					buffer := make([]byte, 2048)
++					for {
++						count, from, err := listener.ReadFrom(buffer)
++						if err != nil {
++							return
++						}
++						if !responds {
++							continue
++						}
++						var query dnsmessage.Message
++						if query.Unpack(buffer[:count]) != nil {
++							return
++						}
++						query.Header.Response = true
++						query.Header.RecursionAvailable = true
++						query.Answers = []dnsmessage.Resource{{
++							Header: dnsmessage.ResourceHeader{Name: query.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 10},
++							Body:   &dnsmessage.AResource{A: [4]byte{192, 0, 2, 10}},
++						}}
++						packet, err := query.Pack()
++						if err != nil {
++							return
++						}
++						if _, err = listener.WriteTo(packet, from); err != nil {
++							return
++						}
++					}
++				}()
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++			defer cancel()
++			began := time.Now()
++			addresses, err := stack.LookupContextHost(ctx, "example.test")
++			if backupResponds {
++				if err != nil || len(addresses) != 1 || addresses[0] != "192.0.2.10" {
++					t.Fatalf("healthy backup was not used: addresses=%v error=%v", addresses, err)
++				}
++			} else if err == nil {
++				t.Fatal("DNS blackholes must fail")
++			}
++			if time.Since(began) > 3*time.Second {
++				t.Fatal("DNS exceeded its total deadline")
++			}
++		})
++	}
++}

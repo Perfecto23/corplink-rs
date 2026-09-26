@@ -120,7 +120,7 @@ try {
     Push-Location $patchedRoot
     try {
         if ($runTests) {
-            & go test ./libwg ./corplink ./conn
+            & go test ./libwg ./corplink ./conn ./tun/netstack
             if ($LASTEXITCODE -ne 0) { throw "patched wireguard-go tests failed" }
             if ($env:OS -ne "Windows_NT") {
                 if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) {

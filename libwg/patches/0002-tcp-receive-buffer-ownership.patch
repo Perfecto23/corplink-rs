@@ -58,7 +58,7 @@ diff --git a/conn/bind_tcp_burst_test.go b/conn/bind_tcp_burst_test.go
 new file mode 100644
 --- /dev/null
 +++ b/conn/bind_tcp_burst_test.go
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,76 @@
 +package conn
 +
 +import (
@@ -66,6 +66,7 @@ new file mode 100644
 +	"encoding/binary"
 +	"io"
 +	"net"
++	"sync"
 +	"testing"
 +	"time"
 +)
@@ -81,7 +82,11 @@ new file mode 100644
 +	if err != nil {
 +		t.Fatal(err)
 +	}
-+	defer bind.Close()
++	var closeOnce sync.Once
++	closeBind := func() { closeOnce.Do(func() { _ = bind.Close() }) }
++	defer closeBind()
++	watchdog := time.AfterFunc(10*time.Second, closeBind)
++	defer watchdog.Stop()
 +	endpoint, err := bind.ParseEndpoint(server.Addr().String())
 +	if err != nil {
 +		t.Fatal(err)
