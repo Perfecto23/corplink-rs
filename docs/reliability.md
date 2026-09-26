@@ -6,7 +6,7 @@ VPN 的运行意图、进程存活和隧道可用状态分别记录。日常操�
 
 | Module | 调用方 interface | 核心结果 |
 | --- | --- | --- |
-| 运行监护 | CLI start/foreground/status/stop/restart；Rust 运行状态与恢复策略 | 进程身份与代次一致、当前握手才可 ready、取消可收尾、有限恢复、终态通知 |
+| 运行监护 | CLI start/foreground/status/stop/restart；Rust 运行状态与恢复策略 | 进程身份与代次一致、当前握手才可 ready、取消可收尾、临时故障持续退避、崩溃保护、终态通知 |
 | VPN 选择与认证会话 | Client 登录/连接；Config 只读加载与会话持久化 | 选中节点与协商目标一致；错误分类；用户配置不自动改写；身份隔离与恢复写入 |
 | 网络资源 | NetworkSession 取得/观测/关闭；DNS set/restore | 生产和测试穿过同一生命周期；部分失败回滚；恢复错误可见；原 DNS 可跨异常退出恢复 |
 | managed routes | Rust routes/routes-status；解析与已应用记录 | 预检和运行共用规则；无效响应可用匹配缓存；历史应用记录与当前运行分清 |

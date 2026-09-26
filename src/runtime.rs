@@ -1,4 +1,4 @@
-//! Runtime state, bounded retry, and redacted diagnostic helpers.
+//! Runtime state, retry backoff, and redacted diagnostic helpers.
 //!
 //! The state file is an operational diagnostic sidecar. It contains process
 //! identity and health facts only; authentication material remains in the
