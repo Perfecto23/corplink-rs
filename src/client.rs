@@ -1194,7 +1194,7 @@ impl Client {
         log::info!("try to get wg conf from remote");
         let wg_info = self.fetch_peer_info(&key).await?;
         let mtu = wg_info.setting.vpn_mtu;
-        let dns = wg_info.setting.vpn_dns;
+        let dns = self.conf.connection_dns(wg_info.setting.vpn_dns)?;
         let peer_key = wg_info.public_key;
         let public_key = self
             .conf

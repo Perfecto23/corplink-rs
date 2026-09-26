@@ -140,6 +140,9 @@ pub struct Config {
     /// instead of creating a kernel TUN device. No system interface, routes, DNS
     /// changes or root privileges are required. Only TCP CONNECT is supported.
     pub socks5_listen: Option<String>,
+    /// Explicit DNS servers for userspace SOCKS mode, reached through the VPN.
+    /// Omit to use the server-provided DNS. Does not change system DNS.
+    pub socks5_dns_servers: Option<Vec<std::net::IpAddr>>,
     /// Optional SOCKS5 username/password authentication (RFC 1929). When
     /// `socks5_username` is set and non-empty, clients must authenticate with
     /// these credentials; otherwise the proxy accepts connections without auth.
@@ -165,6 +168,23 @@ impl fmt::Display for Config {
 }
 
 impl Config {
+    pub fn connection_dns(&self, server_dns: String) -> Result<String> {
+        if self.socks5_listen.is_none() {
+            return Ok(server_dns);
+        }
+        match &self.socks5_dns_servers {
+            None => Ok(server_dns),
+            Some(servers) if servers.is_empty() => {
+                anyhow::bail!("socks5_dns_servers must not be empty")
+            }
+            Some(servers) => Ok(servers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")),
+        }
+    }
+
     /// Parse a user configuration and bind its source path without applying
     /// defaults, generating keys, or touching any sidecar/state file.
     pub async fn read_only(file: &str) -> Result<Config> {
@@ -534,5 +554,39 @@ mod tests {
 
         assert!(config.session_identity_matches().unwrap());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod socks_dns_tests {
+    use super::*;
+    #[test]
+    fn explicit_dns_is_validated_and_only_applies_to_netstack() {
+        let mut conf: Config = serde_json::from_value(serde_json::json!({
+            "company_name":"test", "username":"test", "socks5_listen":"127.0.0.1:1088",
+            "socks5_dns_servers":["1.1.1.1", "8.8.8.8"]
+        }))
+        .unwrap();
+        assert_eq!(
+            conf.connection_dns("10.0.0.53".into()).unwrap(),
+            "1.1.1.1,8.8.8.8"
+        );
+        conf.socks5_listen = None;
+        assert_eq!(
+            conf.connection_dns("10.0.0.53".into()).unwrap(),
+            "10.0.0.53"
+        );
+        conf.socks5_listen = Some("127.0.0.1:1088".into());
+        conf.socks5_dns_servers = Some(vec![]);
+        assert!(conf.connection_dns("10.0.0.53".into()).is_err());
+        conf.socks5_dns_servers = None;
+        assert_eq!(
+            conf.connection_dns("10.0.0.53".into()).unwrap(),
+            "10.0.0.53"
+        );
+        assert!(serde_json::from_value::<Config>(serde_json::json!({
+            "company_name":"test", "username":"test", "socks5_dns_servers":["not-an-ip"]
+        }))
+        .is_err());
     }
 }

@@ -307,6 +307,8 @@ scripts/corplink-traffic.sh restart
 }
 ```
 
+当服务端下发的 DNS 在隧道内不可靠时，可显式设置 `"socks5_dns_servers": ["1.1.1.1", "8.8.8.8"]`。这些 DNS 查询仍经过 VPN，不修改系统 DNS；地址必须包含在隧道允许的路由中。省略时沿用服务端 DNS。需要解析公司私有域名时应使用能解析这些域名的公司 DNS，不能直接替换成公共 DNS。
+
 此处 `full` 仅作用于用户态隧道，不替换系统默认路由；只有交给该 SOCKS 入口的请求经过 VPN。监听地址保持 loopback。Surge 的策略和规则示例：
 
 ```ini
