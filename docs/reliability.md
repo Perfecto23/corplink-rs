@@ -78,7 +78,7 @@ cargo build --release --locked
 
 Go C ABI probe 隔离子进程，验证无设备查询、占用端口失败回滚、SOCKS greeting、端口释放、重复启动，以及没有可用 DNS 路径时的真实 C ABI 探测超时。它只使用用户态 netstack、回环监听器和临时文件，不配置 peer 或系统 TUN。Rust/CLI 测试使用回环网关和受控 OS adapter。
 
-TCP 传输的连续包测试位于补丁中的 `conn/bind_tcp_burst_test.go`，通过真实回环 TCP 验证包内容不被后续读取覆盖。接收缓冲区在消费方复制完成后归还池；发送端串行写入完整帧，避免握手与数据并发发送时帧头、包体交错。`conn/bind_tcp_concurrent_test.go` 使用真实回环 TCP 验证并发帧完整性；`--test` 同时运行 `conn` 和 `tun/netstack` 包；DNS 回归包含首选黑洞、备用成功和全部黑洞按期失败，连续包回归自身也有超时收尾。API 响应体中断归类为可恢复传输错误；VPN 协商请求使用 30 秒上限，普通 API 保持原有 10 秒上限。
+TCP 传输的连续包测试位于补丁中的 `conn/bind_tcp_burst_test.go`，通过真实回环 TCP 验证包内容不被后续读取覆盖。接收缓冲区在消费方复制完成后归还池；发送端串行写入完整帧，避免握手与数据并发发送时帧头、包体交错。外层 TCP 的 EOF 或写入失败会条件删除旧连接缓存，下次发送重新拨号；旧 reader 的迟到清理不能删除新连接。拨号和每帧写入各最多等待 5 秒，停止后禁止重新拨号。`conn/bind_tcp_concurrent_test.go` 使用真实回环 TCP 验证并发帧完整性；`--test` 同时运行 `conn` 和 `tun/netstack` 包；DNS 回归包含首选黑洞、备用成功和全部黑洞按期失败，连续包回归自身也有超时收尾。API 响应体中断归类为可恢复传输错误；VPN 协商请求使用 30 秒上限，普通 API 保持原有 10 秒上限。
 
 关键回归入口：
 

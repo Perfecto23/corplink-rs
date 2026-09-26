@@ -1,0 +1,278 @@
+diff --git a/common/map.go b/common/map.go
+--- a/common/map.go
++++ b/common/map.go
+@@ -29,6 +29,10 @@
+ 	return value.(V), ok
+ }
+ 
++func (m *SyncMap[K, V]) CompareAndDelete(k K, v V) bool {
++	return m.m.CompareAndDelete(k, v)
++}
++
+ func (m *SyncMap[K, V]) Delete(k K) {
+ 	m.m.Delete(k)
+ }
+diff --git a/conn/bind_tcp.go b/conn/bind_tcp.go
+--- a/conn/bind_tcp.go
++++ b/conn/bind_tcp.go
+@@ -6,6 +6,7 @@
+ 	"net/netip"
+ 	"runtime"
+ 	"sync"
++	"time"
+ 
+ 	"golang.zx2c4.com/wireguard/common"
+ )
+@@ -87,7 +88,7 @@
+ 
+ func (t *TcpBind) handleConn(conn *net.TCPConn, endpoint Endpoint) {
+ 	go func() {
+-		defer conn.Close()
++		defer t.forgetConn(endpoint, conn)
+ 		for {
+ 			data := t.dataPool.Get().(*recvData)
+ 			// read uint32 size header
+@@ -152,6 +153,9 @@
+ }
+ 
+ func (t *TcpBind) Close() error {
++	if t.closeChan != nil {
++		close(t.closeChan)
++	}
+ 	var err error
+ 	t.tcpConnMap.Range(func(endpoint string, v *net.TCPConn) bool {
+ 		e := v.Close()
+@@ -163,13 +167,21 @@
+ 	if t.listener != nil {
+ 		_ = t.listener.Close()
+ 	}
+-	if t.closeChan != nil {
+-		close(t.closeChan)
+-	}
+ 	return err
+ }
+ 
++// An old reader must not evict a newer connection to the same endpoint.
++func (t *TcpBind) forgetConn(endpoint Endpoint, conn *net.TCPConn) {
++	t.tcpConnMap.CompareAndDelete(endpoint.DstToString(), conn)
++	_ = conn.Close()
++}
++
+ func (t *TcpBind) getConn(endpoint Endpoint) (*net.TCPConn, error) {
++	select {
++	case <-t.closeChan:
++		return nil, net.ErrClosed
++	default:
++	}
+ 	conn, ok := t.tcpConnMap.Load(endpoint.DstToString())
+ 	if ok {
+ 		return conn, nil
+@@ -188,16 +200,23 @@
+ 		IP:   ip,
+ 		Port: int(endpoint.(*StdNetEndpoint).Port()),
+ 	}
+-	conn, err := net.DialTCP("tcp", nil, addr)
++	connection, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp", addr.String())
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	conn = connection.(*net.TCPConn)
++	t.tcpConnMap.Store(endpoint.DstToString(), conn)
++	select {
++	case <-t.closeChan:
++		t.forgetConn(endpoint, conn)
++		return nil, net.ErrClosed
++	default:
++	}
+ 	t.handleConn(conn, endpoint)
+-	t.tcpConnMap.Store(endpoint.DstToString(), conn)
+ 	return conn, nil
+ }
+ 
+-func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) error {
++func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) (err error) {
+ 	t.sendMu.Lock()
+ 	defer t.sendMu.Unlock()
+ 
+@@ -205,10 +224,19 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	defer func() {
++		if err != nil {
++			t.forgetConn(endpoint, conn)
++		}
++	}()
+ 	for _, buf := range bufs {
++		// A blocked outer socket must not indefinitely hold the send lock.
++		if err = conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
++			return err
++		}
+ 		var l reqLen
+ 		l.FromLen(len(buf))
+-		_, err := conn.Write(l[:])
++		_, err = conn.Write(l[:])
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/conn/bind_tcp_reconnect_test.go b/conn/bind_tcp_reconnect_test.go
+new file mode 100644
+--- /dev/null
++++ b/conn/bind_tcp_reconnect_test.go
+@@ -0,0 +1,156 @@
++package conn
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestTCPBindReopensAfterReadAndWriteFailure(t *testing.T) {
++	for _, failedWrite := range []bool{false, true} {
++		name := "peer-eof"
++		if failedWrite {
++			name = "write-error"
++		}
++		t.Run(name, func(t *testing.T) {
++			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer listener.Close()
++			listener.SetDeadline(time.Now().Add(5 * time.Second))
++			bind := NewTCPBind().(*TcpBind)
++			if _, _, err = bind.Open(0); err != nil {
++				t.Fatal(err)
++			}
++			defer bind.Close()
++			endpoint, err := bind.ParseEndpoint(listener.Addr().String())
++			if err != nil {
++				t.Fatal(err)
++			}
++			old, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
++			if err != nil {
++				t.Fatal(err)
++			}
++			remote, err := listener.AcceptTCP()
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer remote.Close()
++			bind.tcpConnMap.Store(endpoint.DstToString(), old)
++			if failedWrite {
++				old.Close()
++				if bind.Send([][]byte{{1}}, endpoint) == nil {
++					t.Fatal("closed writer must fail")
++				}
++			} else {
++				bind.handleConn(old, endpoint)
++				remote.Close()
++			}
++			deadline := time.Now().Add(time.Second)
++			for {
++				if _, exists := bind.tcpConnMap.Load(endpoint.DstToString()); !exists {
++					break
++				}
++				if time.Now().After(deadline) {
++					t.Fatal("failed connection remained cached")
++				}
++				time.Sleep(time.Millisecond)
++			}
++			if err := bind.Send([][]byte{{2}}, endpoint); err != nil {
++				t.Fatal(err)
++			}
++			replacement, err := listener.AcceptTCP()
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer replacement.Close()
++			replacement.SetDeadline(time.Now().Add(time.Second))
++			frame := make([]byte, 5)
++			if _, err = io.ReadFull(replacement, frame); err != nil {
++				t.Fatal(err)
++			}
++			if !bytes.Equal(frame, []byte{1, 0, 0, 0, 2}) {
++				t.Fatalf("bad replacement frame: %x", frame)
++			}
++			// Simulate the old reader finishing after the write path redialed.
++			bind.forgetConn(endpoint, old)
++			if current, ok := bind.tcpConnMap.Load(endpoint.DstToString()); !ok || current == old {
++				t.Fatal("late cleanup removed the replacement")
++			}
++		})
++	}
++}
++
++func TestTCPBindDoesNotRedialAfterClose(t *testing.T) {
++	bind := NewTCPBind().(*TcpBind)
++	if _, _, err := bind.Open(0); err != nil {
++		t.Fatal(err)
++	}
++	if err := bind.Close(); err != nil {
++		t.Fatal(err)
++	}
++	endpoint, err := bind.ParseEndpoint("127.0.0.1:1")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = bind.Send([][]byte{{1}}, endpoint); !errors.Is(err, net.ErrClosed) {
++		t.Fatalf("closed bind attempted a dial: %v", err)
++	}
++}
++
++func TestTCPBindBlockedWriteExpiresAndEvictsConnection(t *testing.T) {
++	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	bind := NewTCPBind().(*TcpBind)
++	if _, _, err = bind.Open(0); err != nil {
++		t.Fatal(err)
++	}
++	defer bind.Close()
++	endpoint, err := bind.ParseEndpoint(listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	client, err := bind.getConn(endpoint)
++	if err != nil {
++		t.Fatal(err)
++	}
++	server, err := listener.AcceptTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	client.SetWriteBuffer(1024)
++	server.SetReadBuffer(1024)
++	done := make(chan error, 1)
++	go func() {
++		packet := make([]byte, 60000)
++		for i := 0; i < 128; i++ {
++			if err := bind.Send([][]byte{packet}, endpoint); err != nil {
++				done <- err
++				return
++			}
++		}
++		done <- nil
++	}()
++	select {
++	case err := <-done:
++		var timeout net.Error
++		if !errors.As(err, &timeout) || !timeout.Timeout() {
++			t.Fatalf("blocked write did not time out: %v", err)
++		}
++		if _, present := bind.tcpConnMap.Load(endpoint.DstToString()); present {
++			t.Fatal("timed-out connection still cached")
++		}
++	case <-time.After(8 * time.Second):
++		server.Close()
++		<-done
++		t.Fatal("blocked send exceeded its deadline")
++	}
++}
