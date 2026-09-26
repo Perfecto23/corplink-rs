@@ -40,6 +40,7 @@ pub enum NetworkMode<'a> {
         username: &'a str,
         password: &'a str,
         dns_probe_host: Option<&'a str>,
+        dns_tcp: bool,
     },
 }
 
@@ -51,6 +52,7 @@ enum RealMode {
         username: String,
         password: String,
         dns_probe_host: Option<String>,
+        dns_tcp: bool,
     },
 }
 
@@ -78,11 +80,13 @@ impl RealNetworkAdapter {
                 username,
                 password,
                 dns_probe_host,
+                dns_tcp,
             } => RealMode::Netstack {
                 listen: listen.to_string(),
                 username: username.to_string(),
                 password: password.to_string(),
                 dns_probe_host: dns_probe_host.map(str::to_owned),
+                dns_tcp,
             },
         };
         Self {
@@ -105,8 +109,16 @@ impl NetworkAdapter for RealNetworkAdapter {
                 listen,
                 username,
                 password,
+                dns_tcp,
                 ..
-            } => wg::start_wg_go_netstack(conf, listen, username, password, self.with_wg_log),
+            } => wg::start_wg_go_netstack(
+                conf,
+                listen,
+                username,
+                password,
+                *dns_tcp,
+                self.with_wg_log,
+            ),
         }
     }
 

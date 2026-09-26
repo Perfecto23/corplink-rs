@@ -40,6 +40,7 @@ def load_bridge(path: Path):
         ctypes.c_char_p,
         ctypes.c_char_p,
         ctypes.c_int,
+        ctypes.c_int,
     ]
     bridge.startWgNetstack.restype = ctypes.c_int
     bridge.probeNetstackDNS.argtypes = [ctypes.c_char_p]
@@ -71,7 +72,7 @@ def errno_value(response: str) -> int:
     return int(match.group(1))
 
 
-def start(bridge, port: int) -> int:
+def start(bridge, port: int, dns_tcp: bool = False) -> int:
     return bridge.startWgNetstack(
         LOG_LEVEL_ERROR,
         PROTOCOL_UDP,
@@ -81,6 +82,7 @@ def start(bridge, port: int) -> int:
         USER,
         PASSWORD,
         MTU,
+        int(dns_tcp),
     )
 
 
@@ -139,8 +141,8 @@ def case_restart(bridge, libc) -> None:
     del libc
     occupied, port = reserve_port()
     occupied.close()
-    for _ in range(2):
-        if start(bridge, port) != 0:
+    for dns_tcp in (False, True):
+        if start(bridge, port, dns_tcp=dns_tcp) != 0:
             raise AssertionError("userspace netstack failed to restart")
         greeting(port)
         bridge.stopWg()

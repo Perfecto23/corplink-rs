@@ -303,11 +303,14 @@ scripts/corplink-traffic.sh restart
 ```json
 {
   "socks5_listen": "127.0.0.1:1088",
-  "route_mode": "full"
+  "route_mode": "full",
+  "managed_routes": { "enabled": false }
 }
 ```
 
-当服务端下发的 DNS 在隧道内不可靠时，可显式设置 `"socks5_dns_servers": ["1.1.1.1", "8.8.8.8"]`。这些 DNS 查询仍经过 VPN，不修改系统 DNS；地址必须包含在隧道允许的路由中。省略时沿用服务端 DNS。需要解析公司私有域名时应使用能解析这些域名的公司 DNS，不能直接替换成公共 DNS。
+在服务端 full 路由已覆盖目标的 SOCKS 分流配置中，应关闭原 TUN 用的 `managed_routes` 动态路由下载；否则 GitHub 已固定走 Corplink 时，冷启动会依赖尚未建立的隧道下载 GitHub Meta，缓存过期后无法恢复。切回 split/TUN 模式前需重新检查所需路由。
+
+当服务端下发的 DNS 在隧道内不可靠时，可显式设置 `"socks5_dns_servers": ["1.1.1.1", "8.8.8.8"]`。这些 DNS 查询仍经过 VPN，不修改系统 DNS；地址必须包含在隧道允许的路由中。省略时沿用服务端 DNS。若隧道内 UDP DNS 不稳定但 TCP/53 可达，可设置 `"socks5_dns_tcp": true`；SOCKS 解析和健康探测会一起使用 DNS-over-TCP，仍受总超时和备用 DNS 预算约束。需要解析公司私有域名时应使用能解析这些域名的公司 DNS，不能直接替换成公共 DNS。
 
 此处 `full` 仅作用于用户态隧道，不替换系统默认路由；只有交给该 SOCKS 入口的请求经过 VPN。监听地址保持 loopback。Surge 的策略和规则示例：
 
@@ -315,13 +318,19 @@ scripts/corplink-traffic.sh restart
 [Proxy]
 Corplink = socks5, 127.0.0.1, 1088
 
+[Proxy Group]
+CompanyVPN = select, Corplink
+CompanyWeb = select, DIRECT
+
 [Rule]
-# 公司域名规则应位于通用代理规则之前。
-DOMAIN-SUFFIX,github.com,Corplink
-DOMAIN-SUFFIX,company.example.com,Corplink
+# 白名单目标优先；普通公司网站可在 CompanyWeb 中选择常规代理。
+DOMAIN-SUFFIX,github.com,CompanyVPN
+DOMAIN-SUFFIX,githubusercontent.com,CompanyVPN
+DOMAIN-SUFFIX,githubassets.com,CompanyVPN
+DOMAIN-SUFFIX,company.example.com,CompanyWeb
 ```
 
-按实际需要补充公司域名和数据库 endpoint；VPN 节点的外层连接应单独直连，不能再次送入 Corplink。普通 `DIRECT` 不等于“经过公司 VPN”，验收必须包含 Surge 开启时的公司资源请求和普通上网请求。调整节点、TCP/UDP 或分流后，握手成功仍不能替代 HTTP/数据库访问验证。
+只把需要公司出口的域名和私有 endpoint 交给 CompanyVPN。第三方 GitHub 规则集可能包含 npm 等公共开发服务，不应整体绑定到公司 VPN；普通公司网站单独分组。VPN 节点的外层连接必须走 Corplink 之外的路径；可以直连，也可以仅将 VPN 传输端口交给普通代理，控制 API 保留独立路径，避免形成回环。普通 `DIRECT` 不等于“经过公司 VPN”，验收必须包含 Surge 开启时的公司资源请求和普通上网请求。调整节点、TCP/UDP 或分流后，握手成功仍不能替代 HTTP/数据库访问验证。
 
 ### 平台行为
 

@@ -1,0 +1,152 @@
+diff --git a/tun/netstack/tun.go b/tun/netstack/tun.go
+--- a/tun/netstack/tun.go
++++ b/tun/netstack/tun.go
+@@ -47,10 +47,14 @@
+ 	incomingPacket chan *buffer.View
+ 	mtu            int
+ 	dnsServers     []netip.Addr
++	dnsOverTCP     bool
+ 	hasV4, hasV6   bool
+ }
+ 
+ type Net netTun
++
++// SetDNSOverTCP selects DNS transport before the stack is exposed to callers.
++func (tnet *Net) SetDNSOverTCP(enabled bool) { tnet.dnsOverTCP = enabled }
+ 
+ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
+ 	opts := stack.Options{
+@@ -657,7 +661,11 @@
+ 		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotMarshalDNSMessage
+ 	}
+ 
+-	for _, useUDP := range []bool{true, false} {
++	transports := []bool{true, false}
++	if tnet.dnsOverTCP {
++		transports = []bool{false}
++	}
++	for _, useUDP := range transports {
+ 		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
+ 		defer cancel()
+ 
+diff --git a/libwg/main.go b/libwg/main.go
+--- a/libwg/main.go
++++ b/libwg/main.go
+@@ -215,7 +215,7 @@
+ //	mtu:         interface MTU (<=0 uses the default)
+ //
+ //export startWgNetstack
+-func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListen, socksUser, socksPass *C.cchar_t, mtu C.int) C.int {
++func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListen, socksUser, socksPass *C.cchar_t, mtu, dnsTCP C.int) C.int {
+ 	logger = device.NewLogger(int(logLevel), "wg-corplink(netstack) ")
+ 	stopWg()
+ 	logger.Verbosef("Starting wg-corplink version %s (netstack/socks5 mode)", Version)
+@@ -245,6 +245,7 @@
+ 		logger.Errorf("Failed to create netstack TUN device: %v", err)
+ 		return ExitSetupFailed
+ 	}
++	netStack.SetDNSOverTCP(dnsTCP != 0)
+ 	runtimeMu.Lock()
+ 	tnet = netStack
+ 	runtimeMu.Unlock()
+diff --git a/tun/netstack/dns_tcp_test.go b/tun/netstack/dns_tcp_test.go
+new file mode 100644
+--- /dev/null
++++ b/tun/netstack/dns_tcp_test.go
+@@ -0,0 +1,96 @@
++package netstack
++
++import (
++	"context"
++	"encoding/binary"
++	"io"
++	"net/netip"
++	"testing"
++	"time"
++
++	"golang.org/x/net/dns/dnsmessage"
++)
++
++func TestTCPDNSWorksWhenUDPIsBlackholed(t *testing.T) {
++	for _, scenario := range []struct {
++		name                     string
++		tcpDNS, primaryBlackhole bool
++	}{
++		{"udp-blackhole", false, false},
++		{"tcp-resolver", true, false},
++		{"tcp-primary-blackhole-backup-healthy", true, true},
++	} {
++		t.Run(scenario.name, func(t *testing.T) {
++			ips := []netip.Addr{netip.MustParseAddr("10.0.0.1")}
++			if scenario.primaryBlackhole {
++				ips = append(ips, netip.MustParseAddr("10.0.0.2"))
++			}
++			dev, stack, err := CreateNetTUN(ips, ips, 1420)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer dev.Close()
++			stack.SetDNSOverTCP(scenario.tcpDNS)
++			for index, ip := range ips {
++				blackhole := scenario.primaryBlackhole && index == 0
++				udp, err := stack.ListenUDPAddrPort(netip.AddrPortFrom(ip, 53))
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer udp.Close()
++				listener, err := stack.ListenTCPAddrPort(netip.AddrPortFrom(ip, 53))
++				if err != nil {
++					t.Fatal(err)
++				}
++				done := make(chan struct{})
++				defer func() { listener.Close(); <-done }()
++				go func() {
++					defer close(done)
++					conn, err := listener.Accept()
++					if err != nil {
++						return
++					}
++					defer conn.Close()
++					conn.SetDeadline(time.Now().Add(3 * time.Second))
++					if blackhole {
++						_, _ = io.Copy(io.Discard, conn)
++						return
++					}
++					var size [2]byte
++					if _, err = io.ReadFull(conn, size[:]); err != nil {
++						return
++					}
++					request := make([]byte, binary.BigEndian.Uint16(size[:]))
++					if _, err = io.ReadFull(conn, request); err != nil {
++						return
++					}
++					var response dnsmessage.Message
++					if response.Unpack(request) != nil {
++						return
++					}
++					response.Header.Response = true
++					response.Answers = []dnsmessage.Resource{{
++						Header: dnsmessage.ResourceHeader{Name: response.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
++						Body:   &dnsmessage.AResource{A: [4]byte{192, 0, 2, 5}},
++					}}
++					packet, err := response.Pack()
++					if err != nil {
++						return
++					}
++					binary.BigEndian.PutUint16(size[:], uint16(len(packet)))
++					conn.Write(append(size[:], packet...))
++				}()
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++			defer cancel()
++			addresses, err := stack.LookupContextHost(ctx, "example.test")
++			if !scenario.tcpDNS {
++				if err == nil {
++					t.Fatal("UDP blackhole unexpectedly resolved")
++				}
++			} else if err != nil || len(addresses) != 1 || addresses[0] != "192.0.2.5" {
++				t.Fatalf("TCP DNS failed: %v %v", addresses, err)
++			}
++		})
++	}
++}

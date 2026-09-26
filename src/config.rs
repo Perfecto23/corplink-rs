@@ -143,6 +143,8 @@ pub struct Config {
     /// Explicit DNS servers for userspace SOCKS mode, reached through the VPN.
     /// Omit to use the server-provided DNS. Does not change system DNS.
     pub socks5_dns_servers: Option<Vec<std::net::IpAddr>>,
+    /// Use TCP instead of UDP for DNS within the userspace tunnel.
+    pub socks5_dns_tcp: Option<bool>,
     /// Optional SOCKS5 username/password authentication (RFC 1929). When
     /// `socks5_username` is set and non-empty, clients must authenticate with
     /// these credentials; otherwise the proxy accepts connections without auth.

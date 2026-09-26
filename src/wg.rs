@@ -37,6 +37,7 @@ fn start_wg_netstack(
     socks_user: &str,
     socks_pass: &str,
     mtu: i32,
+    dns_tcp: bool,
 ) -> Result<i32> {
     let c_addresses = CString::new(addresses).context("addresses contains null character")?;
     let c_dns = CString::new(dns).context("dns contains null character")?;
@@ -53,6 +54,7 @@ fn start_wg_netstack(
             c_user.as_ptr(),
             c_pass.as_ptr(),
             mtu,
+            i32::from(dns_tcp),
         ))
     }
 }
@@ -94,6 +96,7 @@ pub fn start_wg_go_netstack(
     socks_listen: &str,
     socks_user: &str,
     socks_pass: &str,
+    dns_tcp: bool,
     with_log: bool,
 ) -> Result<()> {
     log::info!("start wg-corplink in netstack/socks5 mode");
@@ -116,6 +119,7 @@ pub fn start_wg_go_netstack(
         socks_user,
         socks_pass,
         conf.mtu as i32,
+        dns_tcp,
     )?;
     if !matches!(ret, 0) {
         return Err(anyhow!("start_wg_netstack returned non-zero code: {ret}"));

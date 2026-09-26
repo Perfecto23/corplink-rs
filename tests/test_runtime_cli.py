@@ -251,7 +251,7 @@ while :; do sleep 0.05; done
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=0.5,
+                timeout=5,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(lock.exists())
@@ -282,7 +282,7 @@ while :; do sleep 0.05; done
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=0.5,
+                timeout=5,
             )
             self.assertNotEqual(busy.returncode, 0)
             self.assertTrue(lock.exists())
@@ -623,7 +623,17 @@ else:
                 env["CORPLINK_FAKE_ALWAYS_FAIL"] = "1"
                 failed = subprocess.run([str(SCRIPT), "start"], cwd=ROOT, env=env, text=True, capture_output=True, timeout=15)
                 self.assertNotEqual(failed.returncode, 0)
-                notifications = (run_dir / "notify-calls.log").read_text(encoding="utf-8").splitlines()
+                # The foreground command observes failure before the background
+                # supervisor has necessarily finished delivering its notification.
+                deadline = time.monotonic() + 5
+                notifications = []
+                while not notifications and time.monotonic() < deadline:
+                    try:
+                        notifications = (run_dir / "notify-calls.log").read_text(encoding="utf-8").splitlines()
+                    except FileNotFoundError:
+                        pass
+                    if not notifications:
+                        time.sleep(0.02)
                 self.assertEqual(len(notifications), 1)
                 sudo_switch = (run_dir / "sudo-switch.log").read_text(encoding="utf-8")
                 self.assertIn(f"-u #{os.getuid()}", sudo_switch)

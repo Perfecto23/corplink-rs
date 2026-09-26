@@ -151,6 +151,7 @@ async fn run() -> Result<()> {
     let socks5_username = conf.socks5_username.clone().unwrap_or_default();
     let socks5_password = conf.socks5_password.clone().unwrap_or_default();
     let netstack_mode = socks5_listen.is_some();
+    let socks5_dns_tcp = conf.socks5_dns_tcp.unwrap_or(false);
 
     if !netstack_mode {
         check_privilege();
@@ -350,6 +351,7 @@ async fn run() -> Result<()> {
                 username: &socks5_username,
                 password: &socks5_password,
                 dns_probe_host: dns_probe_host.as_deref(),
+                dns_tcp: socks5_dns_tcp,
             },
             None => NetworkMode::Kernel,
         };
