@@ -292,15 +292,13 @@ pub enum RetryDecision {
 
 #[derive(Clone, Debug)]
 pub struct RecoveryPolicy {
-    max_transient_attempts: u32,
     transient_attempts: u32,
     auth_attempts: u32,
 }
 
 impl RecoveryPolicy {
-    pub fn new(max_transient_attempts: u32) -> Self {
+    pub fn new() -> Self {
         Self {
-            max_transient_attempts,
             transient_attempts: 0,
             auth_attempts: 0,
         }
@@ -318,10 +316,7 @@ impl RecoveryPolicy {
     }
 
     pub fn on_transient_failure(&mut self) -> RetryDecision {
-        if self.transient_attempts >= self.max_transient_attempts {
-            return RetryDecision::Fail;
-        }
-        self.transient_attempts += 1;
+        self.transient_attempts = self.transient_attempts.saturating_add(1);
         RetryDecision::Retry {
             attempt: self.transient_attempts,
             delay: bounded_backoff(self.transient_attempts),
@@ -610,22 +605,25 @@ mod tests {
     }
 
     #[test]
-    fn recovery_policy_bounds_transient_health_failures() {
-        let mut policy = RecoveryPolicy::new(2);
-        assert!(matches!(
-            policy.on_transient_failure(),
-            RetryDecision::Retry { attempt: 1, .. }
-        ));
-        assert!(matches!(
-            policy.on_transient_failure(),
-            RetryDecision::Retry { attempt: 2, .. }
-        ));
-        assert_eq!(policy.on_transient_failure(), RetryDecision::Fail);
+    fn transient_network_failures_keep_retrying_with_capped_backoff() {
+        let mut policy = RecoveryPolicy::new();
+        for attempt in 1..=100 {
+            match policy.on_transient_failure() {
+                RetryDecision::Retry {
+                    attempt: actual,
+                    delay,
+                } => {
+                    assert_eq!(actual, attempt);
+                    assert!(delay <= Duration::from_secs(30));
+                }
+                other => panic!("temporary network failure stopped recovery: {other:?}"),
+            }
+        }
     }
 
     #[test]
     fn recovery_policy_does_not_retry_interaction_or_configuration_failures() {
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
         assert_eq!(
             policy.on_failure(FailureKind::InteractionRequired),
             RetryDecision::Fail
@@ -638,7 +636,7 @@ mod tests {
 
     #[test]
     fn recovery_policy_allows_one_reauthentication_then_stops_looping() {
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
         assert_eq!(
             policy.on_failure(FailureKind::AuthenticationExpired),
             RetryDecision::Reauthenticate

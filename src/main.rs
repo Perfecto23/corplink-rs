@@ -176,61 +176,55 @@ async fn run() -> Result<()> {
     #[cfg(target_os = "linux")]
     let dns_backup_filename = conf.dns_backup_filename.clone();
 
-    if conf.server.is_none() {
-        let discovery = async {
-            client::get_company_url(conf.company_name.as_str())
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to fetch company server from company name {}",
-                        conf.company_name
-                    )
-                })
-        };
-        match runtime::run_bounded(discovery, Duration::from_secs(10), &mut shutdown_rx).await {
-            runtime::OperationOutcome::Completed(result) => {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        return Err(terminal_failure_error(runtime_store.as_ref(), error));
-                    }
-                };
-                log::info!(
-                    "company name is {}(zh)/{}(en) server is {}",
-                    resp.zh_name,
-                    resp.en_name,
-                    resp.domain
-                );
-                // Keep discovery in memory; user configuration is not runtime state.
+    let mut recovery_policy = RecoveryPolicy::new();
+    while conf.server.is_none() {
+        let result = runtime::run_bounded(
+            client::get_company_url(conf.company_name.as_str()),
+            Duration::from_secs(10),
+            &mut shutdown_rx,
+        )
+        .await;
+        let error = match result {
+            runtime::OperationOutcome::Completed(Ok(resp)) => {
                 conf.server = Some(resp.domain);
+                break;
+            }
+            runtime::OperationOutcome::Completed(Err(error)) => error,
+            runtime::OperationOutcome::TimedOut => {
+                anyhow::Error::new(api::ClientFailure::transport("company_match deadline"))
             }
             runtime::OperationOutcome::Cancelled => {
                 if let Some(store) = runtime_store.as_ref() {
-                    let _ = store.mark_stopping();
                     let _ = store.mark_stopped();
                 }
                 return Ok(());
             }
-            runtime::OperationOutcome::TimedOut => {
-                return Err(terminal_failure_error(
-                    runtime_store.as_ref(),
-                    anyhow::Error::new(api::ClientFailure::transport("company_match deadline")),
-                ));
+        };
+        match recovery_policy.on_failure(api::classify_error(&error)) {
+            RetryDecision::Retry { attempt, delay } => {
+                if let Some(store) = runtime_store.as_ref() {
+                    let _ = store
+                        .mark_degraded("company discovery temporarily unavailable; retry pending");
+                }
+                log::warn!(
+                    "company discovery retry {attempt}: {}",
+                    runtime::redact(&error.to_string())
+                );
+                if wait_for_retry(delay, &mut shutdown_rx).await {
+                    if let Some(store) = runtime_store.as_ref() {
+                        let _ = store.mark_stopped();
+                    }
+                    return Ok(());
+                }
             }
+            _ => return Err(terminal_failure_error(runtime_store.as_ref(), error)),
         }
     }
 
-    // Reuse the discovered company control hostname; no public test service
-    // or new user configuration is needed. Literal-IP deployments skip DNS.
-    let dns_probe_host = conf
-        .server
-        .as_deref()
-        .and_then(|server| reqwest::Url::parse(server).ok())
-        .and_then(|url| url.domain().map(str::to_owned));
     let with_wg_log = conf.debug_wg.unwrap_or_default();
     let platform = conf.platform.clone();
     let mut client = Client::new(conf).context("failed to initialize client")?;
-    let mut recovery_policy = RecoveryPolicy::new(3);
+    recovery_policy.reset_after_ready();
     let handshake_deadline = duration_from_env("CORPLINK_HANDSHAKE_DEADLINE_SECS", 60);
 
     loop {
@@ -265,7 +259,7 @@ async fn run() -> Result<()> {
                                 store.mark_degraded("temporary authentication transport failure");
                         }
                         log::warn!(
-                            "authentication retry {attempt}/3 after {}s: {}",
+                            "authentication retry {attempt} after {}s: {}",
                             delay.as_secs(),
                             runtime::redact(&error.to_string())
                         );
@@ -320,7 +314,7 @@ async fn run() -> Result<()> {
                             let _ = store.mark_degraded("temporary VPN connection failure");
                         }
                         log::warn!(
-                            "connection retry {attempt}/3 after {}s: {}",
+                            "connection retry {attempt} after {}s: {}",
                             delay.as_secs(),
                             runtime::redact(&error.to_string())
                         );
@@ -350,7 +344,6 @@ async fn run() -> Result<()> {
                 listen,
                 username: &socks5_username,
                 password: &socks5_password,
-                dns_probe_host: dns_probe_host.as_deref(),
                 dns_tcp: socks5_dns_tcp,
             },
             None => NetworkMode::Kernel,
@@ -573,7 +566,7 @@ where
                         let _ = store.mark_degraded(&format!("{context}; retry pending"));
                     }
                     log::warn!(
-                        "{context}; retry {attempt}/3 after {}s: {message}; cleanup={cleanup}",
+                        "{context}; retry {attempt} after {}s: {message}; cleanup={cleanup}",
                         delay.as_secs()
                     );
                     if wait_for_retry(delay, shutdown_rx).await {
@@ -622,22 +615,10 @@ async fn monitor_network(
     runtime_store: Option<&RuntimeStore>,
     interval: Duration,
 ) -> Result<()> {
-    let mut dns_failures = 0;
     loop {
         tokio::time::sleep(interval).await;
         match session.health()? {
             wg::WgHealth::Healthy(age) => {
-                if let Err(error) = session.probe_dns().await {
-                    dns_failures += 1;
-                    if let Some(store) = runtime_store {
-                        let _ = store.mark_degraded("tunnel DNS probe failed");
-                    }
-                    if dns_failures >= 3 {
-                        return Err(error).context("tunnel DNS failed three consecutive probes");
-                    }
-                    continue;
-                }
-                dns_failures = 0;
                 log::info!("VPN health is current; handshake age={}s", age.as_secs());
                 if let Some(store) = runtime_store {
                     let _ = store.mark_health(age);
@@ -743,7 +724,6 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         stop_failures: usize,
         health: Arc<Mutex<Vec<wg::WgHealth>>>,
-        dns_results: Arc<Mutex<Vec<bool>>>,
     }
 
     impl network_session::NetworkAdapter for FakeAdapter {
@@ -778,23 +758,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-
-        fn probe_dns(&mut self) -> AdapterFuture<'_> {
-            let results = Arc::clone(&self.dns_results);
-            Box::pin(async move {
-                let mut values = results.lock().unwrap();
-                let ok = if values.len() > 1 {
-                    values.remove(0)
-                } else {
-                    values.first().copied().unwrap_or(true)
-                };
-                if ok {
-                    Ok(())
-                } else {
-                    Err(anyhow!("tunnel DNS resolution failed"))
-                }
-            })
         }
 
         fn health(&self) -> Result<wg::WgHealth> {
@@ -843,7 +806,6 @@ mod tests {
             events: Arc::clone(&events),
             stop_failures,
             health: Arc::new(Mutex::new(health)),
-            dns_results: Arc::new(Mutex::new(vec![true])),
         };
         let conf = test_conf();
         let session = NetworkSession::acquire_with_adapter(
@@ -865,7 +827,7 @@ mod tests {
         let (_sender, mut shutdown_rx) = watch::channel(false);
         let state_path = test_path("handshake-cleanup-failure");
         let store = RuntimeStore::new(&state_path, "generation-handshake-failure");
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
         let remote_calls = Arc::new(Mutex::new(0_u32));
         let remote_calls_for_cleanup = Arc::clone(&remote_calls);
         let events_for_cleanup = Arc::clone(&events);
@@ -912,7 +874,7 @@ mod tests {
         let (_sender, mut shutdown_rx) = watch::channel(false);
         let state_path = test_path("health-cleanup-failure");
         let store = RuntimeStore::new(&state_path, "generation-health-failure");
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
         let remote_calls = Arc::new(Mutex::new(0_u32));
         let remote_calls_for_cleanup = Arc::clone(&remote_calls);
         let events_for_cleanup = Arc::clone(&events);
@@ -954,7 +916,7 @@ mod tests {
         let store = RuntimeStore::new(&state_path, "generation-stop-failure");
         let (sender, mut shutdown_rx) = watch::channel(false);
         sender.send(true).unwrap();
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
 
         let result = supervise_session(
             &mut session,
@@ -983,7 +945,7 @@ mod tests {
         let (_sender, mut shutdown_rx) = watch::channel(false);
         let state_path = test_path("handshake-retry");
         let store = RuntimeStore::new(&state_path, "generation-handshake-retry");
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
         let events_for_cleanup = Arc::clone(&events);
 
         let result = supervise_session(
@@ -1020,7 +982,7 @@ mod tests {
         let store = RuntimeStore::new(&state_path, "generation-shutdown-stopped");
         let (sender, mut shutdown_rx) = watch::channel(false);
         sender.send(true).unwrap();
-        let mut policy = RecoveryPolicy::new(3);
+        let mut policy = RecoveryPolicy::new();
         let events_for_cleanup = Arc::clone(&events);
 
         let result = supervise_session(
@@ -1048,100 +1010,5 @@ mod tests {
         assert_eq!(state["phase"], "stopped");
         assert_eq!(state["intent"], "stopped");
         let _ = fs::remove_file(state_path);
-    }
-    #[tokio::test]
-    async fn healthy_handshake_with_failed_dns_cleans_up_and_retries() {
-        for initial_ok in [false, true] {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let dns_results = Arc::new(Mutex::new(vec![initial_ok, false, false, false]));
-            let adapter = FakeAdapter {
-                events: Arc::clone(&events),
-                stop_failures: 0,
-                health: Arc::new(Mutex::new(vec![wg::WgHealth::Healthy(
-                    Duration::from_secs(1),
-                )])),
-                dns_results: Arc::clone(&dns_results),
-            };
-            let mut session = NetworkSession::acquire_with_adapter(
-                "dns-test",
-                &test_conf(),
-                Box::new(adapter),
-                false,
-                "10.0.0.53",
-            )
-            .await
-            .unwrap();
-            let path = test_path("dns-retry");
-            let store = RuntimeStore::new(&path, "dns-generation");
-            let (_tx, mut rx) = watch::channel(false);
-            let mut policy = RecoveryPolicy::new(3);
-            let cleanup_events = Arc::clone(&events);
-            let outcome = supervise_session(
-                &mut session,
-                Duration::ZERO,
-                &mut rx,
-                Some(&store),
-                &mut policy,
-                Duration::ZERO,
-                move || async move {
-                    cleanup_events.lock().unwrap().push("remote");
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
-            assert!(matches!(outcome, SessionOutcome::Retry));
-            assert!(session.is_closed());
-            assert_eq!(
-                *events.lock().unwrap(),
-                ["start", "configure", "stop", "remote"]
-            );
-            let state: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(state["phase"], "degraded");
-            assert_eq!(state["ready"], false);
-            if initial_ok {
-                assert_eq!(dns_results.lock().unwrap().len(), 1);
-            }
-            fs::remove_file(path).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn successful_dns_probe_resets_consecutive_failures() {
-        let results = Arc::new(Mutex::new(vec![false, false, true, false, false, true]));
-        let adapter = FakeAdapter {
-            events: Arc::new(Mutex::new(Vec::new())),
-            stop_failures: 0,
-            health: Arc::new(Mutex::new(
-                vec![wg::WgHealth::Healthy(Duration::from_secs(1)); 6]
-                    .into_iter()
-                    .chain([wg::WgHealth::Stale(Duration::from_secs(301))])
-                    .collect(),
-            )),
-            dns_results: Arc::clone(&results),
-        };
-        let mut session = NetworkSession::acquire_with_adapter(
-            "dns-test",
-            &test_conf(),
-            Box::new(adapter),
-            false,
-            "10.0.0.53",
-        )
-        .await
-        .unwrap();
-        let path = test_path("dns-recovered");
-        let store = RuntimeStore::new(&path, "dns-generation");
-        // Six DNS outcomes must finish before the injected handshake failure.
-        // A cumulative (rather than consecutive) failure count exits too early.
-        let error = monitor_network(&mut session, Some(&store), Duration::ZERO)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("handshake is stale"));
-        assert_eq!(results.lock().unwrap().len(), 1);
-        let state: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(state["phase"], "ready");
-        session.close().await.unwrap();
-        fs::remove_file(path).unwrap();
     }
 }

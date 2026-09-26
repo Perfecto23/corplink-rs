@@ -18,7 +18,6 @@ use reqwest_cookie_store::CookieStoreMutex;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use sha2::Digest;
-use tokio::io::AsyncBufReadExt;
 
 use crate::api::{ApiName, ApiUrl, ClientFailure, CORPLINK_APP_VERSION, URL_GET_COMPANY};
 use crate::config::{
@@ -33,24 +32,29 @@ use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.jsonl";
-const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 async fn wait_for_interaction(operation: &'static str) -> Result<()> {
-    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    match tokio::time::timeout(INTERACTION_TIMEOUT, input.read_line(&mut line)).await {
-        Ok(Ok(count)) if count > 0 => Ok(()),
-        Ok(_) | Err(_) => Err(anyhow::Error::new(ClientFailure::interaction(operation))),
-    }
+    read_interactive_line(operation).await.map(|_| ())
 }
 
 async fn read_interactive_line(operation: &'static str) -> Result<String> {
-    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    match tokio::time::timeout(INTERACTION_TIMEOUT, input.read_line(&mut line)).await {
-        Ok(Ok(count)) if count > 0 => Ok(line.trim().to_string()),
-        Ok(_) | Err(_) => Err(anyhow::Error::new(ClientFailure::interaction(operation))),
-    }
+    // Tokio stdin uses a blocking-pool task whose shutdown waits for input.
+    // A detached OS reader lets session cancellation exit without requiring Enter.
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("corplink-input".into())
+        .spawn(move || {
+            let mut line = String::new();
+            let result = match std::io::stdin().read_line(&mut line) {
+                Ok(count) if count > 0 => Ok(line.trim().to_string()),
+                _ => Err(anyhow::Error::new(ClientFailure::interaction(operation))),
+            };
+            let _ = sender.send(result);
+        })
+        .context("failed to start input reader")?;
+    receiver
+        .await
+        .map_err(|_| anyhow::Error::new(ClientFailure::interaction(operation)))?
 }
 
 fn corplink_client_builder() -> ClientBuilder {
@@ -112,6 +116,10 @@ pub async fn get_company_url(code: &str) -> anyhow::Result<RespCompany> {
         .send()
         .await
         .map_err(|_| anyhow::Error::new(ClientFailure::transport("company_match")))?;
+    parse_company_response(resp).await
+}
+
+async fn parse_company_response(resp: Response) -> Result<RespCompany> {
     let status = resp.status();
     if !status.is_success() {
         return Err(anyhow::Error::new(ClientFailure::http(
@@ -119,9 +127,11 @@ pub async fn get_company_url(code: &str) -> anyhow::Result<RespCompany> {
             status.as_u16(),
         )));
     }
-    let resp = resp
-        .json::<Resp<RespCompany>>()
+    let body = resp
+        .bytes()
         .await
+        .map_err(|_| anyhow::Error::new(ClientFailure::transport("company_match")))?;
+    let resp: Resp<RespCompany> = serde_json::from_slice(&body)
         .map_err(|_| anyhow::Error::new(ClientFailure::protocol("company_match", None)))?;
     match resp.code {
         0 => resp.data.context("company response missing data"),
@@ -632,6 +642,9 @@ impl Client {
         for method in resp.login_orders {
             let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method).await;
             if let Err(e) = otp_uri {
+                if crate::api::classify_error(&e).is_retryable() {
+                    return Err(e);
+                }
                 log::warn!("failed to login with method {method}: {e}");
                 continue;
             }
@@ -1599,6 +1612,80 @@ fn dedupe_allowed_ips(allowed_ips: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_interactive_input_does_not_hold_runtime_shutdown() {
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "CORPLINK_TEST_CANCELLED_INPUT";
+        if std::env::var_os(CHILD).is_some() {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                tokio::select! {
+                    _ = read_interactive_line("test input") => panic!("stdin should remain open"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            });
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::tests::cancelled_interactive_input_does_not_hold_runtime_shutdown",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("cancelled input prevented process exit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(input);
+    }
+
+    #[tokio::test]
+    async fn company_response_distinguishes_interrupted_body_from_invalid_json() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for (length, expected) in [
+            (100, crate::api::FailureKind::RecoverableTransport),
+            (7, crate::api::FailureKind::Protocol),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\ninvalid").unwrap();
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let error = parse_company_response(response).await.unwrap_err();
+            assert_eq!(crate::api::classify_error(&error), expected);
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn append_extra_allowed_ips_normalizes_bare_ips_and_dedupes() {

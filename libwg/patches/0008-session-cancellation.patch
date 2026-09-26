@@ -1,0 +1,864 @@
+diff --git a/tun/netstack/tun.go b/tun/netstack/tun.go
+--- a/tun/netstack/tun.go
++++ b/tun/netstack/tun.go
+@@ -48,6 +48,8 @@
+ 	mtu            int
+ 	dnsServers     []netip.Addr
+ 	dnsOverTCP     bool
++	lifetime       context.Context
++	cancel         context.CancelFunc
+ 	hasV4, hasV6   bool
+ }
+ 
+@@ -62,7 +64,10 @@
+ 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
+ 		HandleLocal:        true,
+ 	}
++	lifetime, cancel := context.WithCancel(context.Background())
+ 	dev := &netTun{
++		lifetime:       lifetime,
++		cancel:         cancel,
+ 		ep:             channel.New(1024, uint32(mtu), ""),
+ 		stack:          stack.New(opts),
+ 		events:         make(chan tun.Event, 10),
+@@ -171,6 +176,7 @@
+ }
+ 
+ func (tun *netTun) Close() error {
++	tun.cancel()
+ 	tun.stack.RemoveNIC(1)
+ 	tun.stack.Close()
+ 	tun.ep.RemoveNotify(tun.notifyHandle)
+@@ -666,7 +672,10 @@
+ 		transports = []bool{false}
+ 	}
+ 	for _, useUDP := range transports {
+-		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
++		// Keep the resolver's existing per-attempt retransmission deadline.
++		// SOCKS callers have no cancellation context; an unanswered DNS request
++		// must not retain sockets forever. No extra whole-lookup cutoff is added.
++		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+ 		defer cancel()
+ 
+ 		var c net.Conn
+@@ -674,15 +683,19 @@
+ 		if useUDP {
+ 			c, err = tnet.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(server, 53))
+ 		} else {
+-			c, err = tnet.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(server, 53))
++			c, err = tnet.DialContextTCPAddrPort(attemptCtx, netip.AddrPortFrom(server, 53))
+ 		}
+ 
+ 		if err != nil {
+ 			return dnsmessage.Parser{}, dnsmessage.Header{}, err
+ 		}
+-		if d, ok := ctx.Deadline(); ok && !d.IsZero() {
++		// Cancel outstanding resolver IO when another server already answered.
++		stopCancellation := context.AfterFunc(attemptCtx, func() { _ = c.Close() })
++		if d, ok := attemptCtx.Deadline(); ok && !d.IsZero() {
+ 			err := c.SetDeadline(d)
+ 			if err != nil {
++				stopCancellation()
++				c.Close()
+ 				return dnsmessage.Parser{}, dnsmessage.Header{}, err
+ 			}
+ 		}
+@@ -693,6 +706,7 @@
+ 		} else {
+ 			p, h, err = dnsStreamRoundTrip(c, id, q, tcpReq)
+ 		}
++		stopCancellation()
+ 		c.Close()
+ 		if err != nil {
+ 			if err == context.Canceled {
+@@ -752,6 +766,45 @@
+ }
+ 
+ func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.Type) (dnsmessage.Parser, string, error) {
++	if len(tnet.dnsServers) == 0 {
++		return dnsmessage.Parser{}, "", errNoAnswerFromDNSServer
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	type result struct {
++		parser dnsmessage.Parser
++		server string
++		err    error
++	}
++	// Resolvers share one deadline instead of taking time away from each other.
++	results := make(chan result, len(tnet.dnsServers))
++	for _, server := range tnet.dnsServers {
++		go func(server netip.Addr) {
++			p, address, err := tnet.tryOneNameAtServer(ctx, name, qtype, server)
++			results <- result{p, address, err}
++		}(server)
++	}
++	var firstErr error
++	for range tnet.dnsServers {
++		select {
++		case result := <-results:
++			if result.err == nil {
++				return result.parser, result.server, nil
++			}
++			if firstErr == nil {
++				firstErr = result.err
++			}
++		case <-ctx.Done():
++			if firstErr == nil {
++				firstErr = ctx.Err()
++			}
++			return dnsmessage.Parser{}, "", firstErr
++		}
++	}
++	return dnsmessage.Parser{}, "", firstErr
++}
++
++func (tnet *Net) tryOneNameAtServer(ctx context.Context, name string, qtype dnsmessage.Type, server netip.Addr) (dnsmessage.Parser, string, error) {
+ 	var lastErr error
+ 
+ 	n, err := dnsmessage.NewName(name)
+@@ -765,68 +818,72 @@
+ 	}
+ 
+ 	for i := 0; i < 2; i++ {
+-		for index, server := range tnet.dnsServers {
+-			timeout := 5 * time.Second
+-			if deadline, ok := ctx.Deadline(); ok {
+-				// A silent primary must leave time for the remaining resolvers.
+-				remaining := time.Until(deadline) / time.Duration(len(tnet.dnsServers)-index)
+-				if remaining < timeout {
+-					timeout = remaining
+-				}
+-			}
+-			p, h, err := tnet.exchange(ctx, server, q, timeout)
+-			if err != nil {
+-				dnsErr := &net.DNSError{
+-					Err:    err.Error(),
+-					Name:   name,
+-					Server: server.String(),
+-				}
+-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+-					dnsErr.IsTimeout = true
+-				}
+-				if _, ok := err.(*net.OpError); ok {
+-					dnsErr.IsTemporary = true
+-				}
+-				lastErr = dnsErr
+-				continue
+-			}
+-
+-			if err := checkHeader(&p, h); err != nil {
+-				dnsErr := &net.DNSError{
+-					Err:    err.Error(),
+-					Name:   name,
+-					Server: server.String(),
+-				}
+-				if err == errServerTemporarilyMisbehaving {
+-					dnsErr.IsTemporary = true
+-				}
+-				if err == errNoSuchHost {
+-					dnsErr.IsNotFound = true
+-					return p, server.String(), dnsErr
+-				}
+-				lastErr = dnsErr
+-				continue
+-			}
+-
+-			err = skipToAnswer(&p, qtype)
+-			if err == nil {
+-				return p, server.String(), nil
+-			}
+-			lastErr = &net.DNSError{
++		if ctx.Err() != nil {
++			break
++		}
++		timeout := 5 * time.Second
++		if deadline, ok := ctx.Deadline(); ok {
++			timeout = time.Until(deadline)
++		}
++		p, h, err := tnet.exchange(ctx, server, q, timeout)
++		if err != nil {
++			dnsErr := &net.DNSError{
+ 				Err:    err.Error(),
+ 				Name:   name,
+ 				Server: server.String(),
+ 			}
++			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
++				dnsErr.IsTimeout = true
++			}
++			if _, ok := err.(*net.OpError); ok {
++				dnsErr.IsTemporary = true
++			}
++			lastErr = dnsErr
++			continue
++		}
++
++		if err := checkHeader(&p, h); err != nil {
++			dnsErr := &net.DNSError{
++				Err:    err.Error(),
++				Name:   name,
++				Server: server.String(),
++			}
++			if err == errServerTemporarilyMisbehaving {
++				dnsErr.IsTemporary = true
++			}
+ 			if err == errNoSuchHost {
+-				lastErr.(*net.DNSError).IsNotFound = true
+-				return p, server.String(), lastErr
+-			}
+-		}
++				dnsErr.IsNotFound = true
++				return p, server.String(), dnsErr
++			}
++			lastErr = dnsErr
++			continue
++		}
++
++		err = skipToAnswer(&p, qtype)
++		if err == nil {
++			return p, server.String(), nil
++		}
++		lastErr = &net.DNSError{
++			Err:    err.Error(),
++			Name:   name,
++			Server: server.String(),
++		}
++		if err == errNoSuchHost {
++			lastErr.(*net.DNSError).IsNotFound = true
++			return p, server.String(), lastErr
++		}
++	}
++	if lastErr == nil {
++		lastErr = ctx.Err()
+ 	}
+ 	return dnsmessage.Parser{}, "", lastErr
+ }
+ 
+ func (tnet *Net) LookupContextHost(ctx context.Context, host string) ([]string, error) {
++	ctx, cancel := context.WithCancel(ctx)
++	stop := context.AfterFunc(tnet.lifetime, cancel)
++	defer stop()
++	defer cancel()
+ 	if host == "" || (!tnet.hasV6 && !tnet.hasV4) {
+ 		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+ 	}
+diff --git a/libwg/main.go b/libwg/main.go
+--- a/libwg/main.go
++++ b/libwg/main.go
+@@ -36,6 +36,7 @@
+ )
+ 
+ var wgDevice *device.Device
++var tcpTransport conn.Bind
+ 
+ // tnet is the userspace network stack used in netstack (SOCKS5) mode.
+ // It is nil when running in the normal kernel-TUN mode.
+@@ -99,6 +100,8 @@
+ 	runtimeMu.Lock()
+ 	device := wgDevice
+ 	wgDevice = nil
++	transport := tcpTransport
++	tcpTransport = nil
+ 	listener := socksListener
+ 	socksListener = nil
+ 	socksServeErr = nil
+@@ -107,6 +110,10 @@
+ 	runtimeMu.Unlock()
+ 	if listener != nil {
+ 		_ = listener.Close()
++	}
++	// Cancel IO before Device.Close waits for senders holding device.net.RLock.
++	if transport != nil {
++		_ = transport.Close()
+ 	}
+ 	if device != nil {
+ 		device.Close()
+@@ -155,7 +162,8 @@
+ 	case 0:
+ 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
+ 	case 1:
+-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
++		tcpTransport = conn.NewTCPBind()
++		wgDevice = device.NewDevice(tunDevice, tcpTransport, logger)
+ 	default:
+ 		logger.Errorf("Protocol %d not supported", protocol)
+ 		tunDevice.Close()
+@@ -254,7 +262,8 @@
+ 	case 0:
+ 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
+ 	case 1:
+-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
++		tcpTransport = conn.NewTCPBind()
++		wgDevice = device.NewDevice(tunDevice, tcpTransport, logger)
+ 	default:
+ 		logger.Errorf("Protocol %d not supported", protocol)
+ 		tunDevice.Close()
+diff --git a/libwg/socks5.go b/libwg/socks5.go
+--- a/libwg/socks5.go
++++ b/libwg/socks5.go
+@@ -9,7 +9,6 @@
+ import (
+ 	"context"
+ 	"net"
+-	"time"
+ 
+ 	socks5 "github.com/things-go/go-socks5"
+ 	"golang.zx2c4.com/wireguard/device"
+@@ -34,9 +33,7 @@
+ 	if name == "" || name == "0" {
+ 		return ctx, net.IPv4zero, nil
+ 	}
+-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+-	defer cancel()
+-	addrs, err := r.tnet.LookupContextHost(lookupCtx, name)
++	addrs, err := r.tnet.LookupContextHost(ctx, name)
+ 	if err != nil {
+ 		return ctx, nil, err
+ 	}
+diff --git a/libwg/dns_health.go b/libwg/dns_health.go
+deleted file mode 100644
+--- a/libwg/dns_health.go
++++ /dev/null
+@@ -1,28 +0,0 @@
+-package main
+-
+-/*
+-typedef const char cchar_t;
+-*/
+-import "C"
+-
+-import (
+-	"context"
+-	"time"
+-)
+-
+-//export probeNetstackDNS
+-func probeNetstackDNS(host *C.cchar_t) C.int {
+-	runtimeMu.Lock()
+-	stack := tnet
+-	runtimeMu.Unlock()
+-	if stack == nil {
+-		return 2
+-	}
+-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+-	defer cancel()
+-	addresses, err := stack.LookupContextHost(ctx, C.GoString(host))
+-	if err != nil || len(addresses) == 0 {
+-		return 1
+-	}
+-	return 0
+-}
+diff --git a/conn/bind_tcp.go b/conn/bind_tcp.go
+--- a/conn/bind_tcp.go
++++ b/conn/bind_tcp.go
+@@ -1,12 +1,12 @@
+ package conn
+ 
+ import (
++	"context"
+ 	"io"
+ 	"net"
+ 	"net/netip"
+ 	"runtime"
+ 	"sync"
+-	"time"
+ 
+ 	"golang.zx2c4.com/wireguard/common"
+ )
+@@ -32,6 +32,9 @@
+ }
+ 
+ type TcpBind struct {
++	lifecycleMu sync.Mutex
++	lifetime    context.Context
++	cancel      context.CancelFunc
+ 	// Serialize frame headers and payloads, including concurrent handshake sends.
+ 	sendMu     sync.Mutex
+ 	tcpConnMap common.SyncMap[string, *net.TCPConn]
+@@ -87,6 +90,7 @@
+ }
+ 
+ func (t *TcpBind) handleConn(conn *net.TCPConn, endpoint Endpoint) {
++	closed, received := t.closeChan, t.recvChan
+ 	go func() {
+ 		defer t.forgetConn(endpoint, conn)
+ 		for {
+@@ -116,30 +120,45 @@
+ 			data.size = size
+ 			data.endpoint = endpoint
+ 			select {
+-			case <-t.closeChan:
+-				t.dataPool.Put(data)
+-				return
+-			case t.recvChan <- data:
++			case <-closed:
++				t.dataPool.Put(data)
++				return
++			case received <- data:
+ 				// The receiver owns this buffer until it has copied the packet.
+ 			}
+ 		}
+ 	}()
+ }
+ 
+-func (t *TcpBind) accept() {
++func (t *TcpBind) accept(listener *net.TCPListener, closed <-chan struct{}) {
+ 	for {
+-		conn, err := t.listener.AcceptTCP()
++		conn, err := listener.AcceptTCP()
+ 		if err != nil {
+ 			return
++		}
++		select {
++		case <-closed:
++			conn.Close()
++			return
++		default:
+ 		}
+ 		addrPort := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
+ 		endpoint := &StdNetEndpoint{AddrPort: addrPort}
+ 		t.tcpConnMap.Store(endpoint.DstToString(), conn)
++		select {
++		case <-closed:
++			t.forgetConn(endpoint, conn)
++			return
++		default:
++		}
+ 		t.handleConn(conn, endpoint)
+ 	}
+ }
+ 
+ func (t *TcpBind) Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err error) {
++	t.lifecycleMu.Lock()
++	defer t.lifecycleMu.Unlock()
++	t.lifetime, t.cancel = context.WithCancel(context.Background())
+ 	t.recvChan = make(chan *recvData)
+ 	t.closeChan = make(chan struct{})
+ 
+@@ -147,27 +166,35 @@
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+-	go t.accept()
++	go t.accept(t.listener, t.closeChan)
+ 	fn := t.makeReceive()
+ 	return []ReceiveFunc{fn}, port, nil
+ }
+ 
+ func (t *TcpBind) Close() error {
++	t.lifecycleMu.Lock()
++	if t.cancel != nil {
++		t.cancel()
++		t.cancel = nil
++	}
+ 	if t.closeChan != nil {
+-		close(t.closeChan)
+-	}
+-	var err error
+-	t.tcpConnMap.Range(func(endpoint string, v *net.TCPConn) bool {
+-		e := v.Close()
+-		if e != nil {
+-			err = e
+-		}
++		select {
++		case <-t.closeChan:
++		default:
++			close(t.closeChan)
++		}
++	}
++	listener := t.listener
++	t.lifecycleMu.Unlock()
++	t.tcpConnMap.Range(func(endpoint string, connection *net.TCPConn) bool {
++		_ = connection.Close()
++		t.tcpConnMap.CompareAndDelete(endpoint, connection)
+ 		return true
+ 	})
+-	if t.listener != nil {
+-		_ = t.listener.Close()
+-	}
+-	return err
++	if listener != nil {
++		_ = listener.Close()
++	}
++	return nil
+ }
+ 
+ // An old reader must not evict a newer connection to the same endpoint.
+@@ -177,10 +204,11 @@
+ }
+ 
+ func (t *TcpBind) getConn(endpoint Endpoint) (*net.TCPConn, error) {
+-	select {
+-	case <-t.closeChan:
++	t.lifecycleMu.Lock()
++	lifetime := t.lifetime
++	t.lifecycleMu.Unlock()
++	if lifetime == nil || lifetime.Err() != nil {
+ 		return nil, net.ErrClosed
+-	default:
+ 	}
+ 	conn, ok := t.tcpConnMap.Load(endpoint.DstToString())
+ 	if ok {
+@@ -200,14 +228,14 @@
+ 		IP:   ip,
+ 		Port: int(endpoint.(*StdNetEndpoint).Port()),
+ 	}
+-	connection, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp", addr.String())
++	connection, err := (&net.Dialer{}).DialContext(lifetime, "tcp", addr.String())
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	conn = connection.(*net.TCPConn)
+ 	t.tcpConnMap.Store(endpoint.DstToString(), conn)
+ 	select {
+-	case <-t.closeChan:
++	case <-lifetime.Done():
+ 		t.forgetConn(endpoint, conn)
+ 		return nil, net.ErrClosed
+ 	default:
+@@ -230,10 +258,6 @@
+ 		}
+ 	}()
+ 	for _, buf := range bufs {
+-		// A blocked outer socket must not indefinitely hold the send lock.
+-		if err = conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+-			return err
+-		}
+ 		var l reqLen
+ 		l.FromLen(len(buf))
+ 		_, err = conn.Write(l[:])
+diff --git a/conn/bind_tcp_concurrent_test.go b/conn/bind_tcp_concurrent_test.go
+--- a/conn/bind_tcp_concurrent_test.go
++++ b/conn/bind_tcp_concurrent_test.go
+@@ -30,6 +30,10 @@
+ 	client.SetDeadline(time.Now().Add(8 * time.Second))
+ 	server.SetDeadline(time.Now().Add(8 * time.Second))
+ 	bind := NewTCPBind().(*TcpBind)
++	if _, _, err = bind.Open(0); err != nil {
++		t.Fatal(err)
++	}
++	defer bind.Close()
+ 	endpoint, err := bind.ParseEndpoint(listener.Addr().String())
+ 	if err != nil {
+ 		t.Fatal(err)
+diff --git a/conn/bind_tcp_reconnect_test.go b/conn/bind_tcp_reconnect_test.go
+--- a/conn/bind_tcp_reconnect_test.go
++++ b/conn/bind_tcp_reconnect_test.go
+@@ -102,7 +102,7 @@
+ 	}
+ }
+ 
+-func TestTCPBindBlockedWriteExpiresAndEvictsConnection(t *testing.T) {
++func TestTCPBindSlowWriterCanBeStoppedWithoutDeadline(t *testing.T) {
+ 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -130,9 +130,8 @@
+ 	server.SetReadBuffer(1024)
+ 	done := make(chan error, 1)
+ 	go func() {
+-		packet := make([]byte, 60000)
+ 		for i := 0; i < 128; i++ {
+-			if err := bind.Send([][]byte{packet}, endpoint); err != nil {
++			if err := bind.Send([][]byte{make([]byte, 60000)}, endpoint); err != nil {
+ 				done <- err
+ 				return
+ 			}
+@@ -141,16 +140,16 @@
+ 	}()
+ 	select {
+ 	case err := <-done:
+-		var timeout net.Error
+-		if !errors.As(err, &timeout) || !timeout.Timeout() {
+-			t.Fatalf("blocked write did not time out: %v", err)
++		t.Fatalf("slow transport was closed before cancellation: %v", err)
++	case <-time.After(5500 * time.Millisecond):
++	}
++	bind.Close()
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("cancelled write unexpectedly completed")
+ 		}
+-		if _, present := bind.tcpConnMap.Load(endpoint.DstToString()); present {
+-			t.Fatal("timed-out connection still cached")
+-		}
+-	case <-time.After(8 * time.Second):
+-		server.Close()
+-		<-done
+-		t.Fatal("blocked send exceeded its deadline")
++	case <-time.After(time.Second):
++		t.Fatal("stop did not interrupt blocked write")
+ 	}
+ }
+diff --git a/libwg/stop_transport_test.go b/libwg/stop_transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/libwg/stop_transport_test.go
+@@ -0,0 +1,111 @@
++package main
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	"golang.zx2c4.com/wireguard/conn"
++	"golang.zx2c4.com/wireguard/device"
++	"golang.zx2c4.com/wireguard/tun/netstack"
++)
++
++func TestStopInterruptsSendHoldingDeviceLockAndDNS(t *testing.T) {
++	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	ip := netip.MustParseAddr("10.0.0.1")
++	tun, stack, err := netstack.CreateNetTUN([]netip.Addr{ip}, []netip.Addr{ip}, 1420)
++	if err != nil {
++		t.Fatal(err)
++	}
++	stack.SetDNSOverTCP(true)
++	dnsListener, err := stack.ListenTCPAddrPort(netip.AddrPortFrom(ip, 53))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer dnsListener.Close()
++	dnsAccepted := make(chan net.Conn, 1)
++	go func() {
++		c, e := dnsListener.Accept()
++		if e == nil {
++			dnsAccepted <- c
++		}
++	}()
++	dnsDone := make(chan error, 1)
++	go func() { _, e := stack.LookupContextHost(context.Background(), "example.test"); dnsDone <- e }()
++	var dnsConn net.Conn
++	select {
++	case dnsConn = <-dnsAccepted:
++		defer dnsConn.Close()
++	case <-time.After(time.Second):
++		t.Fatal("DNS query did not connect")
++	}
++	logger = device.NewLogger(device.LogLevelSilent, "")
++	tcpTransport = conn.NewTCPBind()
++	wgDevice = device.NewDevice(tun, tcpTransport, logger)
++	if err = wgDevice.Up(); err != nil {
++		t.Fatal(err)
++	}
++	defer stopWg()
++	var publicKey device.NoisePublicKey
++	publicKey[0] = 9
++	peer, err := wgDevice.NewPeer(publicKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	endpoint, err := tcpTransport.ParseEndpoint(listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	peer.SetEndpointFromPacket(endpoint)
++	if err = peer.SendBuffers([][]byte{{1}}); err != nil {
++		t.Fatal(err)
++	}
++	server, err := listener.AcceptTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	server.SetReadBuffer(1024)
++	sending := make(chan error, 1)
++	go func() {
++		for i := 0; i < 2048; i++ {
++			if e := peer.SendBuffers([][]byte{make([]byte, 60000)}); e != nil {
++				sending <- e
++				return
++			}
++		}
++		sending <- nil
++	}()
++	select {
++	case e := <-sending:
++		t.Fatalf("writer stopped before explicit stop: %v", e)
++	case <-time.After(5500 * time.Millisecond):
++	}
++	stopped := make(chan struct{})
++	go func() { stopWg(); close(stopped) }()
++	select {
++	case <-stopped:
++	case <-time.After(2 * time.Second):
++		server.Close()
++		t.Fatal("Device.Close blocked behind active send")
++	}
++	select {
++	case <-sending:
++	case <-time.After(time.Second):
++		t.Fatal("sender remained blocked")
++	}
++	select {
++	case e := <-dnsDone:
++		if e == nil {
++			t.Fatal("cancelled DNS returned success")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("DNS outlived stopped session")
++	}
++}
+diff --git a/libwg/dns_retry_test.go b/libwg/dns_retry_test.go
+new file mode 100644
+--- /dev/null
++++ b/libwg/dns_retry_test.go
+@@ -0,0 +1,76 @@
++package main
++
++import (
++	"context"
++	"encoding/binary"
++	"golang.org/x/net/dns/dnsmessage"
++	"golang.zx2c4.com/wireguard/tun/netstack"
++	"io"
++	"net/netip"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestSOCKSDNSRetryCanFinishAfterFiveSeconds(t *testing.T) {
++	ip := netip.MustParseAddr("10.0.0.1")
++	tun, stack, err := netstack.CreateNetTUN([]netip.Addr{ip}, []netip.Addr{ip}, 1420)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var closeOnce sync.Once
++	closeTun := func() { closeOnce.Do(func() { _ = tun.Close() }) }
++	defer closeTun()
++	stack.SetDNSOverTCP(true)
++	listener, err := stack.ListenTCPAddrPort(netip.AddrPortFrom(ip, 53))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for attempt := 0; attempt < 2; attempt++ {
++			c, e := listener.Accept()
++			if e != nil {
++				return
++			}
++			c.SetDeadline(time.Now().Add(7 * time.Second))
++			var size [2]byte
++			_, e = io.ReadFull(c, size[:])
++			if e != nil {
++				c.Close()
++				return
++			}
++			q := make([]byte, binary.BigEndian.Uint16(size[:]))
++			_, e = io.ReadFull(c, q)
++			if e != nil {
++				c.Close()
++				return
++			}
++			if attempt == 0 {
++				time.Sleep(5500 * time.Millisecond)
++				c.Close()
++				continue
++			}
++			var message dnsmessage.Message
++			if message.Unpack(q) != nil {
++				c.Close()
++				return
++			}
++			message.Header.Response = true
++			message.Answers = []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: message.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}, Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 8}}}}
++			response, _ := message.Pack()
++			binary.BigEndian.PutUint16(size[:], uint16(len(response)))
++			c.Write(append(size[:], response...))
++			c.Close()
++		}
++	}()
++	watchdog := time.AfterFunc(10*time.Second, func() { closeTun(); _ = listener.Close() })
++	defer watchdog.Stop()
++	_, resolved, err := (netstackResolver{tnet: stack}).Resolve(context.Background(), "example.test")
++	if err != nil || resolved.String() != "192.0.2.8" {
++		t.Fatalf("valid delayed lookup rejected: %v %v", resolved, err)
++	}
++	<-done
++}
+diff --git a/tun/netstack/dns_latency_test.go b/tun/netstack/dns_latency_test.go
+new file mode 100644
+--- /dev/null
++++ b/tun/netstack/dns_latency_test.go
+@@ -0,0 +1,69 @@
++package netstack
++
++import (
++	"context"
++	"encoding/binary"
++	"golang.org/x/net/dns/dnsmessage"
++	"io"
++	"net/netip"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestHealthyDNSReplySurvivesTunnelLatency(t *testing.T) {
++	ips := []netip.Addr{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")}
++	dev, stack, err := CreateNetTUN(ips, ips, 1420)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer dev.Close()
++	stack.SetDNSOverTCP(true)
++	var workers sync.WaitGroup
++	for _, ip := range ips {
++		listener, err := stack.ListenTCPAddrPort(netip.AddrPortFrom(ip, 53))
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer listener.Close()
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			c, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			defer c.Close()
++			c.SetDeadline(time.Now().Add(9 * time.Second))
++			var size [2]byte
++			if _, err = io.ReadFull(c, size[:]); err != nil {
++				return
++			}
++			req := make([]byte, binary.BigEndian.Uint16(size[:]))
++			if _, err = io.ReadFull(c, req); err != nil {
++				return
++			}
++			var response dnsmessage.Message
++			if response.Unpack(req) != nil {
++				return
++			}
++			// Observed healthy tunnel DNS replies arrived after the old five-second limit.
++			time.Sleep(5500 * time.Millisecond)
++			response.Header.Response = true
++			response.Answers = []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: response.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}, Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 9}}}}
++			data, err := response.Pack()
++			if err != nil {
++				return
++			}
++			binary.BigEndian.PutUint16(size[:], uint16(len(data)))
++			c.Write(append(size[:], data...))
++		}()
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
++	defer cancel()
++	addresses, err := stack.LookupContextHost(ctx, "example.test")
++	workers.Wait()
++	if err != nil || len(addresses) != 1 || addresses[0] != "192.0.2.9" {
++		t.Fatalf("discarded valid delayed answer: %v %v", addresses, err)
++	}
++}

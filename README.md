@@ -310,7 +310,7 @@ scripts/corplink-traffic.sh restart
 
 在服务端 full 路由已覆盖目标的 SOCKS 分流配置中，应关闭原 TUN 用的 `managed_routes` 动态路由下载；否则 GitHub 已固定走 Corplink 时，冷启动会依赖尚未建立的隧道下载 GitHub Meta，缓存过期后无法恢复。切回 split/TUN 模式前需重新检查所需路由。
 
-当服务端下发的 DNS 在隧道内不可靠时，可显式设置 `"socks5_dns_servers": ["1.1.1.1", "8.8.8.8"]`。这些 DNS 查询仍经过 VPN，不修改系统 DNS；地址必须包含在隧道允许的路由中。省略时沿用服务端 DNS。若隧道内 UDP DNS 不稳定但 TCP/53 可达，可设置 `"socks5_dns_tcp": true`；SOCKS 解析和健康探测会一起使用 DNS-over-TCP，仍受总超时和备用 DNS 预算约束。需要解析公司私有域名时应使用能解析这些域名的公司 DNS，不能直接替换成公共 DNS。
+当服务端下发的 DNS 在隧道内不可靠时，可显式设置 `"socks5_dns_servers": ["1.1.1.1", "8.8.8.8"]`。这些 DNS 查询仍经过 VPN，不修改系统 DNS；地址必须包含在隧道允许的路由中。省略时沿用服务端 DNS。若隧道内 UDP DNS 不稳定但 TCP/53 可达，可设置 `"socks5_dns_tcp": true`；SOCKS 解析会使用 DNS-over-TCP，多台 DNS 并发查询并采用先返回的有效答案；DNS 继承调用者的 deadline 和会话取消，不叠加固定总超时或平分预算；单次请求仍使用解析器原有的超时重试。需要解析公司私有域名时应使用能解析这些域名的公司 DNS，不能直接替换成公共 DNS。
 
 此处 `full` 仅作用于用户态隧道，不替换系统默认路由；只有交给该 SOCKS 入口的请求经过 VPN。监听地址保持 loopback。Surge 的策略和规则示例：
 
