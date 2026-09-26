@@ -21,6 +21,7 @@ VPN 的运行意图、进程存活和隧道可用状态分别记录。日常操�
 - `status` 核对 PID、进程启动标识、运行代次和当前握手年龄；非就绪返回非零。新计算的路由不作为当前已应用证据。
 - `stop` 先撤销运行意图，确认进程退出后才完成。失败保留身份和原因；延迟到达的健康更新不能把停止状态改回运行。
 - 前后台共享运行身份和单实例检查；操作互斥使用进程退出时释放的内核锁。锁文件存在不表示正在执行操作；旧目录锁只在核实 owner 已退出后回收。
+- Netstack 使用现有公司登录域名探测隧道内 DNS（server 为 IP 时不探测）；每次最多 5 秒，不修改系统 DNS。首次 DNS 失败不能发布 ready；运行中首次失败发布 degraded，连续 3 次失败重建连接，成功探测清零连续计数。SOCKS 域名解析也受 5 秒超时约束。
 - 首次握手失败和后续健康失败共用收尾路径。本地资源清理失败进入终态，不继续重连，也不报告停止成功。
 - 可恢复传输失败有等待与次数上限。认证失效只执行受控重新登录；需要交互和永久错误保留可解释终态。
 - macOS 由 launchd 监护后台 supervisor；终态和崩溃耗尽由 supervisor 通知启动用户，按代次去重。Linux systemd 示例对异常进程终止执行有上限的恢复，不重复拉起已处理的正常终态。
@@ -75,7 +76,7 @@ python3 -m py_compile scripts/*.py tests/*.py
 cargo build --release --locked
 ```
 
-Go C ABI probe 隔离子进程，验证无设备查询、占用端口失败回滚、SOCKS greeting、端口释放和重复启动。它只使用用户态 netstack、回环监听器和临时文件，不配置 peer 或系统 TUN。Rust/CLI 测试使用回环网关和受控 OS adapter。
+Go C ABI probe 隔离子进程，验证无设备查询、占用端口失败回滚、SOCKS greeting、端口释放、重复启动，以及没有可用 DNS 路径时的真实 C ABI 探测超时。它只使用用户态 netstack、回环监听器和临时文件，不配置 peer 或系统 TUN。Rust/CLI 测试使用回环网关和受控 OS adapter。
 
 TCP 传输的连续包测试位于补丁中的 `conn/bind_tcp_burst_test.go`，通过真实回环 TCP 验证包内容不被后续读取覆盖。接收缓冲区在消费方复制完成后归还池；发送端串行写入完整帧，避免握手与数据并发发送时帧头、包体交错。`conn/bind_tcp_concurrent_test.go` 使用真实回环 TCP 验证并发帧完整性；`--test` 同时运行 `conn` 包。API 响应体中断归类为可恢复传输错误；VPN 协商请求使用 30 秒上限，普通 API 保持原有 10 秒上限。
 

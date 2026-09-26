@@ -1,0 +1,68 @@
+diff --git a/libwg/dns_health.go b/libwg/dns_health.go
+new file mode 100644
+--- /dev/null
++++ b/libwg/dns_health.go
+@@ -0,0 +1,28 @@
++package main
++
++/*
++typedef const char cchar_t;
++*/
++import "C"
++
++import (
++	"context"
++	"time"
++)
++
++//export probeNetstackDNS
++func probeNetstackDNS(host *C.cchar_t) C.int {
++	runtimeMu.Lock()
++	stack := tnet
++	runtimeMu.Unlock()
++	if stack == nil {
++		return 2
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	addresses, err := stack.LookupContextHost(ctx, C.GoString(host))
++	if err != nil || len(addresses) == 0 {
++		return 1
++	}
++	return 0
++}
+diff --git a/libwg/socks5.go b/libwg/socks5.go
+--- a/libwg/socks5.go
++++ b/libwg/socks5.go
+@@ -9,6 +9,7 @@
+ import (
+ 	"context"
+ 	"net"
++	"time"
+ 
+ 	socks5 "github.com/things-go/go-socks5"
+ 	"golang.zx2c4.com/wireguard/device"
+@@ -33,7 +34,9 @@
+ 	if name == "" || name == "0" {
+ 		return ctx, net.IPv4zero, nil
+ 	}
+-	addrs, err := r.tnet.LookupHost(name)
++	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++	addrs, err := r.tnet.LookupContextHost(lookupCtx, name)
+ 	if err != nil {
+ 		return ctx, nil, err
+ 	}
+diff --git a/libwg/main.go b/libwg/main.go
+--- a/libwg/main.go
++++ b/libwg/main.go
+@@ -245,7 +245,9 @@
+ 		logger.Errorf("Failed to create netstack TUN device: %v", err)
+ 		return ExitSetupFailed
+ 	}
++	runtimeMu.Lock()
+ 	tnet = netStack
++	runtimeMu.Unlock()
+ 
+ 	switch protocol {
+ 	case 0:

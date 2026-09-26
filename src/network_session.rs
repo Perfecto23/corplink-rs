@@ -27,6 +27,9 @@ pub trait NetworkAdapter: Send {
     fn restore_dns(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
     fn health(&self) -> Result<WgHealth>;
+    fn probe_dns(&mut self) -> AdapterFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +39,7 @@ pub enum NetworkMode<'a> {
         listen: &'a str,
         username: &'a str,
         password: &'a str,
+        dns_probe_host: Option<&'a str>,
     },
 }
 
@@ -46,6 +50,7 @@ enum RealMode {
         listen: String,
         username: String,
         password: String,
+        dns_probe_host: Option<String>,
     },
 }
 
@@ -72,10 +77,12 @@ impl RealNetworkAdapter {
                 listen,
                 username,
                 password,
+                dns_probe_host,
             } => RealMode::Netstack {
                 listen: listen.to_string(),
                 username: username.to_string(),
                 password: password.to_string(),
+                dns_probe_host: dns_probe_host.map(str::to_owned),
             },
         };
         Self {
@@ -98,6 +105,7 @@ impl NetworkAdapter for RealNetworkAdapter {
                 listen,
                 username,
                 password,
+                ..
             } => wg::start_wg_go_netstack(conf, listen, username, password, self.with_wg_log),
         }
     }
@@ -136,6 +144,19 @@ impl NetworkAdapter for RealNetworkAdapter {
 
     fn health(&self) -> Result<WgHealth> {
         self.uapi.health(DEFAULT_HANDSHAKE_STALE_AFTER)
+    }
+
+    fn probe_dns(&mut self) -> AdapterFuture<'_> {
+        let host = match &self.mode {
+            RealMode::Netstack { dns_probe_host, .. } => dns_probe_host.clone(),
+            RealMode::Kernel => None,
+        };
+        Box::pin(async move {
+            if let Some(host) = host {
+                wg::probe_netstack_dns(host).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -227,11 +248,18 @@ impl NetworkSession {
         self.adapter.health()
     }
 
-    pub async fn wait_until_ready(&self, deadline: Duration) -> Result<Duration> {
+    pub async fn probe_dns(&mut self) -> Result<()> {
+        self.adapter.probe_dns().await
+    }
+
+    pub async fn wait_until_ready(&mut self, deadline: Duration) -> Result<Duration> {
         let started = tokio::time::Instant::now();
         loop {
             match self.health()? {
-                WgHealth::Healthy(age) => return Ok(age),
+                WgHealth::Healthy(age) => {
+                    self.probe_dns().await?;
+                    return Ok(age);
+                }
                 WgHealth::NoHandshake | WgHealth::Stale(_) => {}
             }
             if started.elapsed() >= deadline {
@@ -448,7 +476,7 @@ mod tests {
             restore_failures: 0,
             health: WgHealth::NoHandshake,
         };
-        let session = NetworkSession::acquire_with_adapter(
+        let mut session = NetworkSession::acquire_with_adapter(
             "test",
             &conf(),
             Box::new(adapter),

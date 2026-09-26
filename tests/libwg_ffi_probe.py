@@ -15,6 +15,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -41,6 +42,8 @@ def load_bridge(path: Path):
         ctypes.c_int,
     ]
     bridge.startWgNetstack.restype = ctypes.c_int
+    bridge.probeNetstackDNS.argtypes = [ctypes.c_char_p]
+    bridge.probeNetstackDNS.restype = ctypes.c_int
     bridge.stopWg.argtypes = []
     bridge.stopWg.restype = None
     bridge.uapi.argtypes = [ctypes.c_char_p]
@@ -144,11 +147,32 @@ def case_restart(bridge, libc) -> None:
         bridge.stopWg()
 
 
+def case_dns_deadline(bridge, libc) -> None:
+    del libc
+    if bridge.probeNetstackDNS(b"example.com") != 2:
+        raise AssertionError("unstarted DNS probe must fail")
+    occupied, port = reserve_port()
+    occupied.close()
+    if start(bridge, port) != 0:
+        raise AssertionError("netstack failed to start")
+    try:
+        began = time.monotonic()
+        result = bridge.probeNetstackDNS(b"example.com")
+        elapsed = time.monotonic() - began
+        if result != 1 or not 4 <= elapsed < 8:
+            raise AssertionError(f"DNS blackhole must fail within deadline: {result}, {elapsed:.2f}s")
+    finally:
+        bridge.stopWg()
+    if bridge.probeNetstackDNS(b"example.com") != 2:
+        raise AssertionError("stopped DNS probe reused a previous session")
+
+
 CASES = {
     "unstarted": case_unstarted,
     "occupied": case_occupied,
     "stop-releases-port": case_stop_releases_port,
     "restart": case_restart,
+    "dns-deadline": case_dns_deadline,
 }
 
 

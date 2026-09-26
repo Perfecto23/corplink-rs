@@ -123,6 +123,21 @@ pub fn start_wg_go_netstack(
     Ok(())
 }
 
+/// Resolve through the same userspace DNS path as SOCKS requests. Go bounds
+/// the operation to five seconds; blocking FFI never occupies a Tokio worker.
+pub async fn probe_netstack_dns(host: String) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let host = CString::new(host).context("DNS probe host contains null character")?;
+        let status = unsafe { libwg::probeNetstackDNS(host.as_ptr()) };
+        match status {
+            0 => Ok(()),
+            _ => Err(anyhow!("tunnel DNS resolution failed (status {status})")),
+        }
+    })
+    .await
+    .context("tunnel DNS probe task failed")?
+}
+
 pub struct UAPIClient {
     pub name: String,
 }
