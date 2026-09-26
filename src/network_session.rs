@@ -16,6 +16,8 @@ use crate::wg::{self, UAPIClient, WgHealth};
 
 const DEFAULT_HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(300);
 
+pub type HealthFuture = Pin<Box<dyn Future<Output = Result<WgHealth>> + Send>>;
+
 pub type AdapterFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 /// The operating-system resource boundary. Production and tests use the same
@@ -26,7 +28,7 @@ pub trait NetworkAdapter: Send {
     fn set_dns(&mut self, dns: &str) -> Result<()>;
     fn restore_dns(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
-    fn health(&self) -> Result<WgHealth>;
+    fn health(&self) -> HealthFuture;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,8 +149,17 @@ impl NetworkAdapter for RealNetworkAdapter {
         Ok(())
     }
 
-    fn health(&self) -> Result<WgHealth> {
-        self.uapi.health(DEFAULT_HANDSHAKE_STALE_AFTER)
+    fn health(&self) -> HealthFuture {
+        let name = self.name.clone();
+        Box::pin(async move {
+            // UAPI can wait behind transport/peer locks. Keep stop selectable;
+            // stopping the adapter cancels transport and releases this worker.
+            tokio::task::spawn_blocking(move || {
+                UAPIClient { name }.health(DEFAULT_HANDSHAKE_STALE_AFTER)
+            })
+            .await
+            .context("WireGuard health worker failed")?
+        })
     }
 }
 
@@ -236,14 +247,14 @@ impl NetworkSession {
         Ok(session)
     }
 
-    pub fn health(&self) -> Result<WgHealth> {
-        self.adapter.health()
+    pub async fn health(&mut self) -> Result<WgHealth> {
+        self.adapter.health().await
     }
 
     pub async fn wait_until_ready(&mut self, deadline: Duration) -> Result<Duration> {
         let started = tokio::time::Instant::now();
         loop {
-            match self.health()? {
+            match self.health().await? {
                 WgHealth::Healthy(age) => return Ok(age),
                 WgHealth::NoHandshake | WgHealth::Stale(_) => {}
             }
@@ -385,8 +396,9 @@ mod tests {
             Ok(())
         }
 
-        fn health(&self) -> Result<WgHealth> {
-            Ok(self.health.clone())
+        fn health(&self) -> HealthFuture {
+            let health = self.health.clone();
+            Box::pin(async move { Ok(health) })
         }
     }
 

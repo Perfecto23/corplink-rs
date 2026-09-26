@@ -617,7 +617,7 @@ async fn monitor_network(
 ) -> Result<()> {
     loop {
         tokio::time::sleep(interval).await;
-        match session.health()? {
+        match session.health().await? {
             wg::WgHealth::Healthy(age) => {
                 log::info!("VPN health is current; handshake age={}s", age.as_secs());
                 if let Some(store) = runtime_store {
@@ -724,6 +724,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         stop_failures: usize,
         health: Arc<Mutex<Vec<wg::WgHealth>>>,
+        block_health: bool,
     }
 
     impl network_session::NetworkAdapter for FakeAdapter {
@@ -760,13 +761,18 @@ mod tests {
             }
         }
 
-        fn health(&self) -> Result<wg::WgHealth> {
+        fn health(&self) -> network_session::HealthFuture {
             let mut health = self.health.lock().unwrap();
-            if health.len() > 1 {
-                Ok(health.remove(0))
-            } else {
-                Ok(health.first().cloned().unwrap_or(wg::WgHealth::NoHandshake))
+            if self.block_health && health.len() == 1 {
+                self.events.lock().unwrap().push("health_pending");
+                return Box::pin(std::future::pending());
             }
+            let value = if health.len() > 1 {
+                health.remove(0)
+            } else {
+                health.first().cloned().unwrap_or(wg::WgHealth::NoHandshake)
+            };
+            Box::pin(async move { Ok(value) })
         }
     }
 
@@ -806,6 +812,7 @@ mod tests {
             events: Arc::clone(&events),
             stop_failures,
             health: Arc::new(Mutex::new(health)),
+            block_health: false,
         };
         let conf = test_conf();
         let session = NetworkSession::acquire_with_adapter(
@@ -1010,5 +1017,52 @@ mod tests {
         assert_eq!(state["phase"], "stopped");
         assert_eq!(state["intent"], "stopped");
         let _ = fs::remove_file(state_path);
+    }
+    #[tokio::test]
+    async fn stop_can_cancel_a_pending_health_read() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let adapter = FakeAdapter {
+            events: Arc::clone(&events),
+            stop_failures: 0,
+            block_health: true,
+            health: Arc::new(Mutex::new(vec![wg::WgHealth::Healthy(Duration::ZERO); 2])),
+        };
+        let mut session = NetworkSession::acquire_with_adapter(
+            "test",
+            &test_conf(),
+            Box::new(adapter),
+            false,
+            "10.0.0.53",
+        )
+        .await
+        .unwrap();
+        let (sender, mut receiver) = watch::channel(false);
+        let stop_events = Arc::clone(&events);
+        let stop = tokio::spawn(async move {
+            while !stop_events.lock().unwrap().contains(&"health_pending") {
+                tokio::task::yield_now().await;
+            }
+            sender.send(true).unwrap();
+        });
+        let mut policy = RecoveryPolicy::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise_session(
+                &mut session,
+                Duration::ZERO,
+                &mut receiver,
+                None,
+                &mut policy,
+                Duration::ZERO,
+                || async { Ok(()) },
+            ),
+        )
+        .await
+        .expect("health read blocked stop")
+        .unwrap();
+        assert!(matches!(outcome, SessionOutcome::Stopped));
+        assert!(session.is_closed());
+        stop.await.unwrap();
+        assert!(events.lock().unwrap().contains(&"stop"));
     }
 }

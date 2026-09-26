@@ -245,51 +245,54 @@ diff --git a/tun/netstack/tun.go b/tun/netstack/tun.go
 diff --git a/libwg/main.go b/libwg/main.go
 --- a/libwg/main.go
 +++ b/libwg/main.go
-@@ -36,6 +36,7 @@
+@@ -36,6 +36,8 @@
  )
  
  var wgDevice *device.Device
 +var tcpTransport conn.Bind
++var transportMu sync.Mutex
  
  // tnet is the userspace network stack used in netstack (SOCKS5) mode.
  // It is nil when running in the normal kernel-TUN mode.
-@@ -99,6 +100,8 @@
+@@ -96,6 +98,15 @@
+ 
+ //export stopWg
+ func stopWg() {
++	// Health/config readers can hold runtimeMu while waiting for a blocked Send.
++	// Transport cancellation must not wait for that lock (or device.net locks).
++	transportMu.Lock()
++	transport := tcpTransport
++	tcpTransport = nil
++	transportMu.Unlock()
++	if transport != nil {
++		_ = transport.Close()
++	}
  	runtimeMu.Lock()
  	device := wgDevice
  	wgDevice = nil
-+	transport := tcpTransport
-+	tcpTransport = nil
- 	listener := socksListener
- 	socksListener = nil
- 	socksServeErr = nil
-@@ -107,6 +110,10 @@
- 	runtimeMu.Unlock()
- 	if listener != nil {
- 		_ = listener.Close()
-+	}
-+	// Cancel IO before Device.Close waits for senders holding device.net.RLock.
-+	if transport != nil {
-+		_ = transport.Close()
- 	}
- 	if device != nil {
- 		device.Close()
-@@ -155,7 +162,8 @@
+@@ -155,7 +166,11 @@
  	case 0:
  		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
  	case 1:
 -		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
-+		tcpTransport = conn.NewTCPBind()
-+		wgDevice = device.NewDevice(tunDevice, tcpTransport, logger)
++		transport := conn.NewTCPBind()
++		transportMu.Lock()
++		tcpTransport = transport
++		transportMu.Unlock()
++		wgDevice = device.NewDevice(tunDevice, transport, logger)
  	default:
  		logger.Errorf("Protocol %d not supported", protocol)
  		tunDevice.Close()
-@@ -254,7 +262,8 @@
+@@ -254,7 +269,11 @@
  	case 0:
  		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
  	case 1:
 -		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
-+		tcpTransport = conn.NewTCPBind()
-+		wgDevice = device.NewDevice(tunDevice, tcpTransport, logger)
++		transport := conn.NewTCPBind()
++		transportMu.Lock()
++		tcpTransport = transport
++		transportMu.Unlock()
++		wgDevice = device.NewDevice(tunDevice, transport, logger)
  	default:
  		logger.Errorf("Protocol %d not supported", protocol)
  		tunDevice.Close()
@@ -595,7 +598,7 @@ diff --git a/libwg/stop_transport_test.go b/libwg/stop_transport_test.go
 new file mode 100644
 --- /dev/null
 +++ b/libwg/stop_transport_test.go
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,133 @@
 +package main
 +
 +import (
@@ -685,6 +688,23 @@ new file mode 100644
 +		t.Fatalf("writer stopped before explicit stop: %v", e)
 +	case <-time.After(5500 * time.Millisecond):
 +	}
++	// A pending peer writer makes a concurrent health read wait behind Send.
++	// Real UAPI reads hold runtimeMu, so stop must cancel transport before it.
++	peerWriter := make(chan struct{})
++	go func() { close(peerWriter); peer.Lock(); peer.Unlock() }()
++	<-peerWriter
++	time.Sleep(20 * time.Millisecond)
++	observedDevice := wgDevice
++	healthStarted, healthDone := make(chan struct{}), make(chan struct{})
++	go func() {
++		runtimeMu.Lock()
++		close(healthStarted)
++		_, _ = observedDevice.IpcGet()
++		runtimeMu.Unlock()
++		close(healthDone)
++	}()
++	<-healthStarted
++	time.Sleep(20 * time.Millisecond)
 +	stopped := make(chan struct{})
 +	go func() { stopWg(); close(stopped) }()
 +	select {
@@ -692,6 +712,11 @@ new file mode 100644
 +	case <-time.After(2 * time.Second):
 +		server.Close()
 +		t.Fatal("Device.Close blocked behind active send")
++	}
++	select {
++	case <-healthDone:
++	case <-time.After(time.Second):
++		t.Fatal("health reader remained blocked")
 +	}
 +	select {
 +	case <-sending:
